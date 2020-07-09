@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2014 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,22 +55,7 @@ class KeywordSearchQueryDelegator {
 
         for (KeywordList keywordList : keywordLists) {
             for (Keyword keyword : keywordList.getKeywords()) {
-                KeywordSearchQuery query;
-                if (keyword.searchTermIsLiteral()) {
-                    // literal, exact match
-                    if (keyword.searchTermIsWholeWord()) {
-                        query = new LuceneQuery(keywordList, keyword);
-                        query.escape();
-                    } // literal, substring match
-                    else {
-                        query = new TermsComponentQuery(keywordList, keyword);
-                        query.escape();
-                        query.setSubstringQuery();
-                    }
-                } // regexp
-                else {
-                    query = new TermsComponentQuery(keywordList, keyword);
-                }
+                KeywordSearchQuery query = KeywordSearchUtil.getQueryForKeyword(keyword, keywordList);
                 queryDelegates.add(query);
             }
         }
@@ -100,7 +85,7 @@ class KeywordSearchQueryDelegator {
         Node rootNode;
         if (queryRequests.size() > 0) {
             Children childNodes =
-                    Children.create(new KeywordSearchResultFactory(queryRequests, searchResultWin), true);
+                    Children.create(new KeywordSearchResultFactory(queryRequests), true);
 
             rootNode = new AbstractNode(childNodes);
         } else {

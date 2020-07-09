@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +23,6 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.logging.Level;
-
-import org.openide.util.NbBundle;
-import org.sleuthkit.autopsy.coreutils.Logger;
 import javax.swing.event.ChangeEvent;
 import javax.swing.event.ChangeListener;
 import org.openide.DialogDescriptor;
@@ -34,33 +31,28 @@ import org.openide.NotifyDescriptor;
 import org.openide.WizardDescriptor;
 import org.openide.WizardValidationException;
 import org.openide.util.HelpCtx;
+import org.openide.util.NbBundle;
 import org.sleuthkit.autopsy.casemodule.Case.CaseType;
+import org.sleuthkit.autopsy.coreutils.FileUtil;
+import org.sleuthkit.autopsy.coreutils.Logger;
 import org.sleuthkit.autopsy.coreutils.ModuleSettings;
 
 /**
- * The "New Case" wizard panel with a component on it. This class represents
- * data of wizard step. It defers creation and initialization of UI component of
- * wizard panel into getComponent() method.
+ * The first panel of the New Case wizard.
  */
 class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDescriptor> {
 
-    /**
-     * The visual component that displays this panel. If you need to access the
-     * component from this class, just use getComponent().
-     */
-    private NewCaseVisualPanel1 component;
-    private Boolean isFinish = false;
-    private static String createdDirectory;
-    private static final String PROP_BASECASE = "LBL_BaseCase_PATH"; //NON-NLS
     private static final Logger logger = Logger.getLogger(NewCaseWizardPanel1.class.getName());
+    private static final String PROP_BASECASE = "LBL_BaseCase_PATH"; //NON-NLS
+    private static String createdDirectory;
+    private final Set<ChangeListener> listeners = new HashSet<>(1);
+    private NewCaseVisualPanel1 component;
+    private boolean isFinish;
 
     /**
-     * Get the visual component for the panel. In this template, the component
-     * is kept separate. This can be more efficient: if the wizard is created
-     * but never displayed, or not all panels are displayed, it is better to
-     * create only those which really need to be visible.
+     * Get the visual component for the panel.
      *
-     * @return component the UI component of this wizard panel
+     * @return The UI component of this wizard panel
      */
     @Override
     public NewCaseVisualPanel1 getComponent() {
@@ -71,70 +63,62 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
     }
 
     /**
-     * Help for this panel. When the panel is active, this is used as the help
-     * for the wizard dialog.
+     * Gets the help object for this panel. When the panel is active, this is
+     * used as the help for the wizard dialog.
      *
-     * @return HelpCtx.DEFAULT_HELP the help for this panel
+     * @return The help for this panel.
      */
     @Override
     public HelpCtx getHelp() {
-        // Show no Help button for this panel:
+        /*
+         * Currently, no help is provided for this panel.
+         */
         return HelpCtx.DEFAULT_HELP;
-        // If you have context help:
-        // return new HelpCtx(SampleWizardPanel1.class);
     }
 
     /**
      * Tests whether the panel is finished. If the panel is valid, the "Finish"
      * button will be enabled.
      *
-     * @return boolean true if all the fields are correctly filled, false
-     *         otherwise
+     * @return boolean True if all the fields are correctly filled, false
+     *         otherwise.
      */
     @Override
     public boolean isValid() {
-        // If it is always OK to press Next or Finish, then:
         return isFinish;
-        // If it depends on some condition (form filled out...), then:
-        // return someCondition();
-        // and when this condition changes (last form field filled in...) then:
-        // fireChangeEvent();
-        // and uncomment the complicated stuff below.
     }
-    private final Set<ChangeListener> listeners = new HashSet<ChangeListener>(1); // or can use ChangeSupport in NB 6.0
 
     /**
-     * Adds a listener to changes of the panel's validity.
+     * Adds a change listener to this panel.
      *
-     * @param l the change listener to add
+     * @param listener The change listener to add.
      */
     @Override
-    public final void addChangeListener(ChangeListener l) {
+    public final void addChangeListener(ChangeListener listener) {
         synchronized (listeners) {
-            listeners.add(l);
+            listeners.add(listener);
         }
     }
 
     /**
-     * Removes a listener to changes of the panel's validity.
+     * Removes a change listener from this panel.
      *
-     * @param l the change listener to move
+     * @param listener The change listener to remove.
      */
     @Override
-    public final void removeChangeListener(ChangeListener l) {
+    public final void removeChangeListener(ChangeListener listener) {
         synchronized (listeners) {
-            listeners.remove(l);
+            listeners.remove(listener);
         }
     }
 
     /**
-     * This method is auto-generated. It seems that this method is used to
-     * listen to any change in this wizard panel.
+     * Notifies any registerd change listeners of a change in the panel.
      */
     protected final void fireChangeEvent() {
         Iterator<ChangeListener> it;
         synchronized (listeners) {
-            it = new HashSet<ChangeListener>(listeners).iterator();
+            it = new HashSet<>(listeners).iterator();
         }
         ChangeEvent ev = new ChangeEvent(this);
         while (it.hasNext()) {
@@ -153,12 +137,8 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
         fireChangeEvent();
     }
 
-    // You can use a settings object to keep track of state. Normally the
-    // settings object will be the WizardDescriptor, so you can use
-    // WizardDescriptor.getProperty & putProperty to store information entered
-    // by the user.
     /**
-     * Provides the wizard panel with the current data--either the default data
+     * Provides the wizard panel with the current data - either the default data
      * or already-modified settings, if the user used the previous and/or next
      * buttons. This method can be called multiple times on one instance of
      * WizardDescriptor.Panel.
@@ -167,15 +147,15 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
      */
     @Override
     public void readSettings(WizardDescriptor settings) {
-        NewCaseVisualPanel1 component = getComponent();
+        NewCaseVisualPanel1 panel = getComponent();
         try {
             String lastBaseDirectory = ModuleSettings.getConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_BASECASE);
-            component.setCaseParentDir(lastBaseDirectory);
-            component.readSettings();
+            panel.setCaseParentDir(lastBaseDirectory);
+            panel.readSettings();
             createdDirectory = (String) settings.getProperty("createdDirectory"); //NON-NLS
-            if (createdDirectory != null && !createdDirectory.equals("")) {
-                logger.log(Level.INFO, "Deleting a case dir in readSettings(): " + createdDirectory); //NON-NLS
-                Case.deleteCaseDirectory(new File(createdDirectory));
+            if (createdDirectory != null && !createdDirectory.isEmpty()) {
+                logger.log(Level.INFO, "Deleting a case dir in readSettings(): {0}", createdDirectory); //NON-NLS
+                FileUtil.deleteDir(new File(createdDirectory));
             }
         } catch (Exception e) {
             logger.log(Level.WARNING, "Could not read wizard settings in NewCaseWizardPanel1, ", e); //NON-NLS
@@ -204,17 +184,21 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
 
     @Override
     public void validate() throws WizardValidationException {
+        /*
+         * Check whether or not the case name is valid. To be valid, the case
+         * name must not contain any characters that are not allowed in file
+         * names, since it will be used as the name of the case directory.
+         */
         String caseName = getComponent().getCaseName();
-        String caseParentDir = getComponent().getCaseParentDir();
-        String caseDirPath = caseParentDir + caseName;
-
-        // check if case Name contain one of this following symbol:
-        //  \ / : * ? " < > |
         if (!Case.isValidName(caseName)) {
             String errorMsg = NbBundle
                     .getMessage(this.getClass(), "NewCaseWizardPanel1.validate.errMsg.invalidSymbols");
             validationError(errorMsg);
         } else {
+
+            String caseParentDir = getComponent().getCaseParentDir();
+            String caseDirPath = caseParentDir + caseName;
+
             // check if the directory exist
             if (new File(caseDirPath).exists()) {
                 // throw a warning to enter new data or delete the existing directory
@@ -242,7 +226,7 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
                             // if user says yes
                             try {
                                 createDirectory(caseDirPath, getComponent().getCaseType());
-                            } catch (Exception ex) {
+                            } catch (WizardValidationException ex) {
                                 String errorMsg = NbBundle.getMessage(this.getClass(),
                                         "NewCaseWizardPanel1.validate.errMsg.cantCreateParDir.msg",
                                         caseParentDir);
@@ -259,7 +243,7 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
                     } else {
                         try {
                             createDirectory(caseDirPath, getComponent().getCaseType());
-                        } catch (Exception ex) {
+                        } catch (WizardValidationException ex) {
                             String errorMsg = NbBundle
                                     .getMessage(this.getClass(), "NewCaseWizardPanel1.validate.errMsg.cantCreateDir");
                             logger.log(Level.WARNING, errorMsg, ex);
@@ -298,7 +282,7 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
 
             // delete the folder if we already created the folder and the error shows up
             if (new File(caseDirPath).exists()) {
-                Case.deleteCaseDirectory(new File(caseDirPath));
+                FileUtil.deleteDir(new File(caseDirPath));
             }
 
             String errorMsg = NbBundle.getMessage(this.getClass(),
@@ -316,7 +300,7 @@ class NewCaseWizardPanel1 implements WizardDescriptor.ValidatingPanel<WizardDesc
                 logger.log(Level.WARNING, "Startup window didn't close as expected.", ex); //NON-NLS
 
             }
-
         }
     }
+    
 }

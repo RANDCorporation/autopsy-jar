@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2015 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,8 +22,10 @@ import java.io.Serializable;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.Objects;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.Immutable;
 import javax.annotation.concurrent.ThreadSafe;
@@ -32,16 +34,23 @@ import org.sleuthkit.autopsy.coreutils.NetworkUtils;
 import org.sleuthkit.autopsy.ingest.IngestJob;
 
 /**
- * An automated ingest job for a manifest. The manifest specifies a co-located
- * data source and a case to which the data source is to be added.
+ * An automated ingest job, which is an ingest job performed by the automated
+ * ingest service.
  */
 @ThreadSafe
-public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializable {
+final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializable {
 
     private static final long serialVersionUID = 1L;
+    private static final int CURRENT_VERSION = 2;
+    private static final int DEFAULT_PRIORITY = 0;
     private static final String LOCAL_HOST_NAME = NetworkUtils.getLocalHostName();
+
+    /*
+     * Version 0 fields.
+     */
     private final Manifest manifest;
-    private final String nodeName;
+    @GuardedBy("this")
+    private String nodeName;
     @GuardedBy("this")
     private String caseDirectoryPath;
     @GuardedBy("this")
@@ -55,90 +64,147 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
     @GuardedBy("this")
     transient private IngestJob ingestJob;
     @GuardedBy("this")
-    transient private boolean cancelled; // RJCTODO: Document
+    transient private boolean cancelled;
     @GuardedBy("this")
-    transient private boolean completed; // RJCTODO: Document
+    transient private boolean completed;
     @GuardedBy("this")
     private Date completedDate;
     @GuardedBy("this")
     private boolean errorsOccurred;
 
-    /**
-     * Constructs an automated ingest job for a manifest. The manifest specifies
-     * a co-located data source and a case to which the data source is to be
-     * added.
-     *
-     * @param manifest          The manifest
-     * @param caseDirectoryPath The path to the case directory for the job, may
-     *                          be null.
-     * @param priority          The priority of the job. The higher the number,
-     *                          the higher the priority.
-     * @param nodeName          If the job is in progress, the node doing the
-     *                          processing, otherwise the locla host.
-     * @param stage             The processing stage for display purposes.
-     * @param completedDate     The date when the job was completed. Use the
-     *                          epoch (January 1, 1970, 00:00:00 GMT) to
-     *                          indicate the the job is not completed, i.e., new
-     *                          Date(0L).
+    /*
+     * Version 1 fields.
      */
-    // RJCTODO: The null case directory is error-prone and the nodeName is confusing.
-    AutoIngestJob(Manifest manifest, Path caseDirectoryPath, int priority, String nodeName, Stage stage, Date completedDate, boolean errorsOccurred) {
-        this.manifest = manifest;
-        if (null != caseDirectoryPath) {
-            this.caseDirectoryPath = caseDirectoryPath.toString();
-        } else {
+    private final int version; // For possible future use.
+    @GuardedBy("this")
+    private ProcessingStatus processingStatus;
+    @GuardedBy("this")
+    private int numberOfCrashes;
+    @GuardedBy("this")
+    private StageDetails stageDetails;
+    
+    /*
+     * Version 2 fields.
+     */
+    @GuardedBy("this")
+    private long dataSourceSize;
+
+    /**
+     * Constructs a new automated ingest job. All job state not specified in the
+     * job manifest is set to the default state for a new job.
+     *
+     * @param manifest The manifest for an automated ingest job.
+     */
+    AutoIngestJob(Manifest manifest) throws AutoIngestJobException {
+        try {
+            /*
+             * Version 0 fields.
+             */
+            this.manifest = manifest;
+            this.nodeName = "";
             this.caseDirectoryPath = "";
+            this.priority = DEFAULT_PRIORITY;
+            this.stage = Stage.PENDING;
+            this.stageStartDate = manifest.getDateFileCreated();
+            this.dataSourceProcessor = null;
+            this.ingestJob = null;
+            this.cancelled = false;
+            this.completed = false;
+            this.completedDate = new Date(0);
+            this.errorsOccurred = false;
+
+            /*
+             * Version 1 fields.
+             */
+            this.version = CURRENT_VERSION;
+            this.processingStatus = ProcessingStatus.PENDING;
+            this.numberOfCrashes = 0;
+            this.stageDetails = this.getProcessingStageDetails();
+            
+            /*
+             * Version 2 fields.
+             */
+            this.dataSourceSize = 0;
+        } catch (Exception ex) {
+            throw new AutoIngestJobException(String.format("Error creating automated ingest job"), ex);
         }
-        this.priority = priority;
-        this.nodeName = nodeName;
-        this.stage = stage;
-        this.stageStartDate = manifest.getDateFileCreated();
-        this.completedDate = completedDate;
-        this.errorsOccurred = errorsOccurred;
     }
 
     /**
-     * Gets the auto ingest jobmanifest.
+     * Constructs an automated ingest job using the coordination service node
+     * data for the job.
      *
-     * @return The manifest.
+     * @param nodeData The coordination service node data for an automated
+     *                 ingest job.
+     */
+    AutoIngestJob(AutoIngestJobNodeData nodeData) throws AutoIngestJobException {
+        try {
+            /*
+             * Version 0 fields.
+             */
+            this.manifest = new Manifest(nodeData.getManifestFilePath(), nodeData.getManifestFileDate(), nodeData.getCaseName(), nodeData.getDeviceId(), nodeData.getDataSourcePath(), Collections.emptyMap());
+            this.nodeName = nodeData.getProcessingHostName();
+            this.caseDirectoryPath = nodeData.getCaseDirectoryPath().toString();
+            this.priority = nodeData.getPriority();
+            this.stage = nodeData.getProcessingStage();
+            this.stageStartDate = nodeData.getProcessingStageStartDate();
+            this.dataSourceProcessor = null; // Transient data not in node data.
+            this.ingestJob = null; // Transient data not in node data.
+            this.cancelled = false; // Transient data not in node data.
+            this.completed = false; // Transient data not in node data.
+            this.completedDate = nodeData.getCompletedDate();
+            this.errorsOccurred = nodeData.getErrorsOccurred();
+
+            /*
+             * Version 1 fields.
+             */
+            this.version = CURRENT_VERSION;
+            this.processingStatus = nodeData.getProcessingStatus();
+            this.numberOfCrashes = nodeData.getNumberOfCrashes();
+            this.stageDetails = this.getProcessingStageDetails();
+            
+            /*
+             * Version 2 fields.
+             */
+            this.dataSourceSize = nodeData.getDataSourceSize();
+        } catch (Exception ex) {
+            throw new AutoIngestJobException(String.format("Error creating automated ingest job"), ex);
+        }
+    }
+
+    /**
+     * Gets the job manifest.
+     *
+     * @return The job manifest.
      */
     Manifest getManifest() {
         return this.manifest;
     }
 
     /**
-     * Queries whether or not a case directory path has been set for this auto
-     * ingest job.
+     * Sets the path to the case directory for the job.
      *
-     * @return True or false
-     */
-    // RJCTODO: Use this or lose this
-    synchronized boolean hasCaseDirectoryPath() {
-        return (false == this.caseDirectoryPath.isEmpty());
-    }
-
-    /**
-     * Sets the path to the case directory of the case associated with this job.
-     *
-     * @param caseDirectoryPath The path to the case directory.
+     * @param caseDirectoryPath The path to the case directory. Can be the empty
+     *                          path if the case directory has not been created
+     *                          yet.
      */
     synchronized void setCaseDirectoryPath(Path caseDirectoryPath) {
-        this.caseDirectoryPath = caseDirectoryPath.toString();
+        if (null != caseDirectoryPath) {
+            this.caseDirectoryPath = caseDirectoryPath.toString();
+        } else {
+            this.caseDirectoryPath = "";
+        }
     }
 
     /**
-     * Gets the path to the case directory of the case associated with this job,
-     * may be null.
+     * Gets the path to the case directory for job, may be the empty path if the
+     * case directory has not been created yet.
      *
-     * @return The case directory path or null if the case directory has not
-     *         been created yet.
+     * @return The case directory path. Will be the empty path if the case
+     *         directory has not been created yet.
      */
     synchronized Path getCaseDirectoryPath() {
-        if (!caseDirectoryPath.isEmpty()) {
-            return Paths.get(caseDirectoryPath);
-        } else {
-            return null;
-        }
+        return Paths.get(caseDirectoryPath);
     }
 
     /**
@@ -162,52 +228,49 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
     }
 
     /**
-     * RJCTODO
+     * Sets the processing stage of the job. The start date/time for the stage
+     * is set when the stage is set.
      *
-     * @param newStage
+     * @param newStage The processing stage.
+     * @param stageStartDate The date and time this stage started.
      */
-    synchronized void setStage(Stage newStage) {
-        setStage(newStage, Date.from(Instant.now()));
-    }
-
-    /**
-     * RJCTODO
-     *
-     * @param state
-     * @param stateStartedDate
-     */
-    synchronized void setStage(Stage newState, Date stateStartedDate) {
-        if (Stage.CANCELLING == this.stage && Stage.COMPLETED != newState) {
+    synchronized void setProcessingStage(Stage newStage, Date stageStartDate) {
+        if (Stage.CANCELLING == this.stage && Stage.COMPLETED != newStage) {
             return;
         }
-        this.stage = newState;
-        this.stageStartDate = stateStartedDate;
+        this.stage = newStage;
+        this.stageStartDate = stageStartDate;
     }
 
     /**
-     * RJCTODO:
+     * Gets the processing stage of the job.
      *
-     * @return
+     * @return The processing stage.
      */
-    synchronized Stage getStage() {
+    synchronized Stage getProcessingStage() {
         return this.stage;
     }
 
     /**
-     * RJCTODO
+     * Gets the date/time the current processing stage of the job started.
      *
-     * @return
+     * @return The current processing stage start date/time.
      */
-    synchronized Date getStageStartDate() {
-        return this.stageStartDate;
+    synchronized Date getProcessingStageStartDate() {
+        return new Date(this.stageStartDate.getTime());
     }
 
     /**
-     * RJCTODO
+     * Gets any available details associated with the current processing stage
+     * of the job, e.g., the currently running data source level ingest module,
+     * an ingest module in the process of being cancelled, etc. If no additional
+     * details are available, the stage details will be the same as the
+     * processing stage.
      *
-     * @return
+     * @return A stage details object consisting of a descrition and associated
+     *         date/time.
      */
-    synchronized StageDetails getStageDetails() {
+    synchronized StageDetails getProcessingStageDetails() {
         String description;
         Date startDate;
         if (Stage.CANCELLING != this.stage && null != this.ingestJob) {
@@ -223,7 +286,7 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
                 if (!ingestModuleHandle.isCancelled()) {
                     description = ingestModuleHandle.displayName();
                 } else {
-                    description = String.format(Stage.CANCELLING_MODULE.getDisplayText(), ingestModuleHandle.displayName()); // RJCTODO: FIx this
+                    description = String.format(Stage.CANCELLING_MODULE.getDisplayText(), ingestModuleHandle.displayName());
                 }
             } else {
                 /**
@@ -241,35 +304,47 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
             description = this.stage.getDisplayText();
             startDate = this.stageStartDate;
         }
-        return new StageDetails(description, startDate);
+        this.stageDetails = new StageDetails(description, startDate);
+        return this.stageDetails;
     }
 
+    /**
+     * Sets the data source processor for the job. Used for job cancellation.
+     *
+     * @param dataSourceProcessor A data source processor for the job.
+     */
     synchronized void setDataSourceProcessor(DataSourceProcessor dataSourceProcessor) {
         this.dataSourceProcessor = dataSourceProcessor;
     }
 
     /**
-     * RJCTODO
+     * Sets the ingest job for the auto ingest job. Used for obtaining
+     * processing stage details, cancelling the currently running data source
+     * ingest module, and cancelling the job.
+     *
+     * @param ingestJob The ingest job for the auto ingest job.
      */
-    // RJCTODO: Consider moving this class into AIM and making this private
     synchronized void setIngestJob(IngestJob ingestJob) {
         this.ingestJob = ingestJob;
     }
 
     /**
-     * RJCTODO
+     * Gets the ingest job for the auto ingest job.
+     *
+     * @return The ingest job, may be null.
+     *
+     * TODO (JIRA-3059): Provide an AutoIngestJob ingest module cancellation API
+     * instead.
      */
-    // RJCTODO: Consider moving this class into AIM and making this private. 
-    // Or move the AID into a separate package. Or do not worry about it.
     synchronized IngestJob getIngestJob() {
         return this.ingestJob;
     }
 
     /**
-     * RJCTODO
+     * Cancels the job.
      */
     synchronized void cancel() {
-        setStage(Stage.CANCELLING);
+        setProcessingStage(Stage.CANCELLING, Date.from(Instant.now()));
         cancelled = true;
         errorsOccurred = true;
         if (null != dataSourceProcessor) {
@@ -281,24 +356,31 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
     }
 
     /**
-     * RJCTODO
+     * Indicates whether or not the job has been cancelled. This is transient
+     * state used by the auto ingest manager that is not saved as coordination
+     * service node data for the job.
+     *
+     * @return True or false.
      */
-    synchronized boolean isCancelled() {
+    synchronized boolean isCanceled() {
         return cancelled;
     }
 
     /**
-     * RJCTODO
+     * Marks the job as completed. This is transient state used by the auto
+     * ingest manager that is not saved as coordination service node data for
+     * the job.
      */
     synchronized void setCompleted() {
-        setStage(Stage.COMPLETED);
+        setProcessingStage(Stage.COMPLETED, Date.from(Instant.now()));
         completed = true;
     }
 
     /**
-     * RJCTODO
+     * Indicates whether or not the job has been completed. This is transient
+     * state that is not saved as coordination service node data for the job.
      *
-     * @return
+     * @return True or false.
      */
     synchronized boolean isCompleted() {
         return completed;
@@ -311,7 +393,7 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
      * @param completedDate The completion date.
      */
     synchronized void setCompletedDate(Date completedDate) {
-        this.completedDate = completedDate;
+        this.completedDate = new Date(completedDate.getTime());
     }
 
     /**
@@ -321,11 +403,11 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
      * @return True or false.
      */
     synchronized Date getCompletedDate() {
-        return completedDate; // RJCTODO: Consider returning null if == 0 (epoch)
+        return new Date(completedDate.getTime());
     }
 
     /**
-     * Sets whether or not erros occurred during the processing of the job.
+     * Sets whether or not errors occurred during the processing of the job.
      *
      * @param errorsOccurred True or false;
      */
@@ -334,100 +416,149 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
     }
 
     /**
-     * Queries whether or not erros occurred during the processing of the job.
+     * Queries whether or not errors occurred during the processing of the job.
      *
      * @return True or false.
      */
-    synchronized boolean hasErrors() {
+    synchronized boolean getErrorsOccurred() {
         return this.errorsOccurred;
     }
 
     /**
-     * RJCTODO Gets name of the node associated with the job, possibly a remote
-     * hose if the job is in progress.
+     * Gets the processing host name for this job.
      *
-     * @return The node name.
+     * @return The processing host name.
      */
-    String getNodeName() {
+    synchronized String getProcessingHostName() {
         return nodeName;
     }
 
     /**
-     * RJCTODO
+     * Sets the processing host name for this job.
      *
-     * @param obj
-     *
-     * @return
+     * @param processingHostName The processing host name.
      */
-    @Override
-    public boolean equals(Object obj) {
-        if (!(obj instanceof AutoIngestJob)) {
-            return false;
-        }
-        if (obj == this) {
-            return true;
-        }
-        return this.getManifest().getFilePath().equals(((AutoIngestJob) obj).getManifest().getFilePath());
+    synchronized void setProcessingHostName(String processingHostName) {
+        this.nodeName = processingHostName;
     }
 
     /**
-     * RJCTODO
+     * Gets the processing status of the job.
      *
-     * @return
+     * @return The processing status.
+     */
+    synchronized ProcessingStatus getProcessingStatus() {
+        return this.processingStatus;
+    }
+
+    /**
+     * Sets the processing status of the job.
+     *
+     * @param processingStatus The processing status.
+     */
+    synchronized void setProcessingStatus(ProcessingStatus processingStatus) {
+        this.processingStatus = processingStatus;
+    }
+
+    /**
+     * Gets the number of time this job has "crashed" during processing.
+     *
+     * @return The number of crashes.
+     */
+    synchronized int getNumberOfCrashes() {
+        return this.numberOfCrashes;
+    }
+
+    /**
+     * Sets the number of time this job has "crashed" during processing.
+     *
+     * @param numberOfCrashes The number of crashes.
+     */
+    synchronized void setNumberOfCrashes(int numberOfCrashes) {
+        this.numberOfCrashes = numberOfCrashes;
+    }
+
+    /**
+     * Gets the total size of the data source.
+     *
+     * @return The data source size.
+     */
+    synchronized long getDataSourceSize() {
+        return dataSourceSize;
+    }
+
+    /**
+     * Sets the total size of the data source.
+     *
+     * @param dataSourceSize The data source size.
+     */
+    synchronized void setDataSourceSize(long dataSourceSize) {
+        this.dataSourceSize = dataSourceSize;
+    }
+
+    /**
+     * Indicates whether some other job is "equal to" this job. Two jobs are
+     * equal if they have the same manifest file path.
+     *
+     * @param otherJob The job to which this job is to be compared.
+     *
+     * @return True or false.
+     */
+    @Override
+    public boolean equals(Object otherJob) {
+        if (!(otherJob instanceof AutoIngestJob)) {
+            return false;
+        }
+        if (otherJob == this) {
+            return true;
+        }
+        return this.getManifest().getFilePath().equals(((AutoIngestJob) otherJob).getManifest().getFilePath());
+    }
+
+    /**
+     * Returns a hash code value for the job. The hash code is derived from the
+     * manifest file path.
+     *
+     * @return The hash code.
      */
     @Override
     public int hashCode() {
-        // RJCTODO: Update this
-        int hash = 7;
-//        hash = 71 * hash + Objects.hashCode(this.dateCreated);
+        int hash = 71 * (Objects.hashCode(this.getManifest().getFilePath()));
         return hash;
     }
 
     /**
-     * RJCTODO Default sorting is by ready file creation date, descending
+     * Compares one job to another in a way that orders jobs by manifest
+     * creation date.
      *
-     * @param o
+     * @param otherJob The job to which this job is to be compared.
      *
-     * @return
+     * @return A negative integer, zero, or a positive integer as this job is
+     *         less than, equal to, or greater than the specified job.
      */
     @Override
-    public int compareTo(AutoIngestJob o) {
-        return -this.getManifest().getDateFileCreated().compareTo(o.getManifest().getDateFileCreated());
+    public int compareTo(AutoIngestJob otherJob) {
+        return -this.getManifest().getDateFileCreated().compareTo(otherJob.getManifest().getDateFileCreated());
     }
 
     /**
-     * Custom comparator that allows us to sort List<AutoIngestJob> on reverse
-     * chronological date modified (descending)
+     * Comparator that supports doing a descending sort of jobs based on job
+     * completion date.
      */
-    static class ReverseDateCompletedComparator implements Comparator<AutoIngestJob> {
+    static class CompletedDateDescendingComparator implements Comparator<AutoIngestJob> {
 
-        /**
-         * RJCTODO
-         *
-         * @param o1
-         * @param o2
-         *
-         * @return
-         */
         @Override
         public int compare(AutoIngestJob o1, AutoIngestJob o2) {
-            return -o1.getStageStartDate().compareTo(o2.getStageStartDate());
+            return -o1.getCompletedDate().compareTo(o2.getCompletedDate());
         }
+
     }
 
     /**
-     * Comparator that sorts auto ingest jobs by priority in descending order.
+     * Comparator that orders jobs in descending order by job priority.
      */
     public static class PriorityComparator implements Comparator<AutoIngestJob> {
 
-        /**
-         * RJCTODO
-         *
-         * @param job
-         * @param anotherJob
-         *
-         * @return
-         */
         @Override
         public int compare(AutoIngestJob job, AutoIngestJob anotherJob) {
             return -(job.getPriority().compareTo(anotherJob.getPriority()));
@@ -436,36 +567,51 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
     }
 
     /**
-     * Custom comparator that allows us to sort List<AutoIngestJob> on case name
-     * alphabetically except for jobs for the current host, which are placed at
-     * the top of the list.
+     * Comparator that orders jobs such that those running on the local host
+     * appear first, then the remaining jobs are sorted alphabetically by case
+     * name. This is very specific to the auto ionghest control panel use case,
+     * where there is at most one job running on the local host.
      */
-    static class AlphabeticalComparator implements Comparator<AutoIngestJob> {
+    static class LocalHostAndCaseComparator implements Comparator<AutoIngestJob> {
 
-        /**
-         * RJCTODO
-         *
-         * @param o1
-         * @param o2
-         *
-         * @return
-         */
         @Override
-        public int compare(AutoIngestJob o1, AutoIngestJob o2) {
-            if (o1.getNodeName().equalsIgnoreCase(LOCAL_HOST_NAME)) {
-                return -1; // o1 is for current case, float to top
-            } else if (o2.getNodeName().equalsIgnoreCase(LOCAL_HOST_NAME)) {
-                return 1; // o2 is for current case, float to top
+        public int compare(AutoIngestJob aJob, AutoIngestJob anotherJob) {
+            if (aJob.getProcessingHostName().equalsIgnoreCase(LOCAL_HOST_NAME)) {
+                return -1;
+            } else if (anotherJob.getProcessingHostName().equalsIgnoreCase(LOCAL_HOST_NAME)) {
+                return 1;
             } else {
-                return o1.getManifest().getCaseName().compareToIgnoreCase(o2.getManifest().getCaseName());
+                return aJob.getManifest().getCaseName().compareToIgnoreCase(anotherJob.getManifest().getCaseName());
             }
         }
+
     }
 
     /**
-     * RJCTODO
+     * Comparator that orders jobs by data source name.
      */
-    // RJCTODO: Combine this enum with StageDetails to make a single class.
+    static class DataSourceFileNameComparator implements Comparator<AutoIngestJob> {
+
+        @Override
+        public int compare(AutoIngestJob aJob, AutoIngestJob anotherJob) {
+            return aJob.getManifest().getDataSourceFileName().compareToIgnoreCase(anotherJob.getManifest().getDataSourceFileName());
+        }
+
+    }
+
+    /**
+     * Processing statuses for an auto ingest job.
+     */
+    enum ProcessingStatus {
+        PENDING,
+        PROCESSING,
+        COMPLETED,
+        DELETED
+    }
+
+    /**
+     * Processing stages for an auto ingest job.
+     */
     enum Stage {
 
         PENDING("Pending"),
@@ -495,43 +641,56 @@ public final class AutoIngestJob implements Comparable<AutoIngestJob>, Serializa
     }
 
     /**
-     * RJCTODO
+     * Processing stage details for an auto ingest job.
      */
     @Immutable
-    static final class StageDetails {
+    static final class StageDetails implements Serializable {
 
+        private static final long serialVersionUID = 1L;
         private final String description;
         private final Date startDate;
 
-        /**
-         * RJCTODO
-         *
-         * @param description
-         * @param startDate
-         */
-        private StageDetails(String description, Date startDate) {
+        StageDetails(String description, Date startDate) {
             this.description = description;
             this.startDate = startDate;
         }
 
-        /**
-         * RJCTODO
-         *
-         * @return
-         */
         String getDescription() {
             return this.description;
         }
 
-        /**
-         * RJCTODO
-         *
-         * @return
-         */
         Date getStartDate() {
-            return this.startDate;
+            return new Date(this.startDate.getTime());
         }
 
     }
+    
+    /**
+     * Exception thrown when there is a problem creating auto ingest job.
+     */
+    final static class AutoIngestJobException extends Exception {
 
+        private static final long serialVersionUID = 1L;
+
+        /**
+         * Constructs an exception to throw when there is a problem creating
+         * auto ingest job.
+         *
+         * @param message The exception message.
+         */
+        private AutoIngestJobException(String message) {
+            super(message);
+        }
+
+        /**
+         * Constructs an exception to throw when there is a problem creating
+         * auto ingest job.
+         *
+         * @param message The exception message.
+         * @param cause   The cause of the exception, if it was an exception.
+         */
+        private AutoIngestJobException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
 }

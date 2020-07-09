@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2014 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,11 +32,11 @@ import org.openide.util.Lookup;
         iconBase = "org/sleuthkit/autopsy/images/interesting_item_32x32.png",
         keywords = "#OptionsCategory_Keywords_InterestingItemDefinitions",
         keywordsCategory = "InterestingItemDefinitions",
-        position = 7
+        position = 10
 )
 public final class InterestingItemDefsOptionsPanelController extends OptionsPanelController {
 
-    private InterestingItemDefsPanel panel;
+    private FilesSetDefsPanel panel;
     private final PropertyChangeSupport pcs = new PropertyChangeSupport(this);
     private boolean changed;
 
@@ -113,9 +113,9 @@ public final class InterestingItemDefsOptionsPanelController extends OptionsPane
         pcs.removePropertyChangeListener(l);
     }
 
-    private InterestingItemDefsPanel getPanel() {
+    private FilesSetDefsPanel getPanel() {
         if (panel == null) {
-            panel = new InterestingItemDefsPanel();
+            panel = new FilesSetDefsPanel(FilesSetDefsPanel.PANEL_TYPE.INTERESTING_FILE_SETS);
             panel.addPropertyChangeListener(new PropertyChangeListener() {
                 @Override
                 public void propertyChange(PropertyChangeEvent evt) {

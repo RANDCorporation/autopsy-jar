@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,147 +19,190 @@
 package org.sleuthkit.autopsy.datamodel;
 
 import java.text.SimpleDateFormat;
-import java.util.TimeZone;
 import java.util.logging.Level;
-
+import org.apache.commons.lang.StringUtils;
 import org.openide.util.NbBundle;
+import org.openide.util.NbBundle.Messages;
 import org.sleuthkit.autopsy.coreutils.Logger;
 import org.sleuthkit.datamodel.BlackboardArtifact;
 import org.sleuthkit.datamodel.BlackboardAttribute;
 import org.sleuthkit.datamodel.Content;
 import org.sleuthkit.datamodel.TskCoreException;
-import org.sleuthkit.datamodel.TskException;
 
 /**
- * StringContent object for a blackboard artifact, that can be looked up and
- * used to display text for the DataContent viewers. Displays values in artifact
- * in HTML. Note that it has no style associated with it and assumes that the
- * pane showing the HTML has styles set (such as with HTMLEditorKit).
+ * An HTML representation of an artifact. The representation is plain vanilla
+ * HTML, so any styling needs to be supplied by the display mechansim. For
+ * example, GUI components such as content viewers might use HTMLEditorKit to
+ * add styling.
+ * 
+ * @deprecated - No longer used by DataContentViewerArtifact because the table is no longer HTML
  */
+@Deprecated
 public class ArtifactStringContent implements StringContent {
 
-    BlackboardArtifact artifact;
+    private final static SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    private final static Logger logger = Logger.getLogger(ArtifactStringContent.class.getName());
+    private final BlackboardArtifact artifact;
     private String stringContent = "";
-    static final Logger logger = Logger.getLogger(ArtifactStringContent.class.getName());
-    private static final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
-    public ArtifactStringContent(BlackboardArtifact art) {
-        artifact = art;
+    /**
+     * Constructs an HTML representation of an artifact. The representation is
+     * plain vanilla HTML, so any styling needs to be supplied by the display
+     * mechansim. For example, GUI components such as content viewers might use
+     * HTMLEditorKit to add styling.
+     *
+     * @param artifact The artifact to be represented as HTML.
+     */
+    public ArtifactStringContent(BlackboardArtifact artifact) {
+        this.artifact = artifact;
     }
 
+    /**
+     * Gets the HTML representation of the artifact.
+     *
+     * @return The HTML representation of the artifact as a string.
+     */
+    @Messages({
+        "ArtifactStringContent.attrsTableHeader.type=Type",
+        "ArtifactStringContent.attrsTableHeader.value=Value",
+        "ArtifactStringContent.attrsTableHeader.sources=Source(s)",
+        "ArtifactStringContent.failedToGetSourcePath.message=Failed to get source file path from case database",
+        "ArtifactStringContent.failedToGetAttributes.message=Failed to get some or all attributes from case database"
+    })
     @Override
-    @SuppressWarnings("deprecation")
     public String getString() {
         if (stringContent.isEmpty()) {
+            /*
+             * Start the document.
+             */
+            StringBuilder buffer = new StringBuilder(1024);
+            buffer.append("<html>\n"); //NON-NLS
+            buffer.append("<body>\n"); //NON-NLS
+
+            /*
+             * Use the artifact display name as a header.
+             */
+            buffer.append("<h3>"); //NON-NLS
+            buffer.append(artifact.getDisplayName());
+            buffer.append("</h3>\n"); //NON-NLS
+
+            /*
+             * Put the attributes, source content path and artifact id in a
+             * table.
+             */
+            buffer.append("<table border='1'>"); //NON-NLS
+            
+            // header row
+            buffer.append("<tr>"); //NON-NLS
+            buffer.append("<th><b>"); //NON-NLS
+            buffer.append(Bundle.ArtifactStringContent_attrsTableHeader_type());
+            buffer.append("</b></th>"); //NON-NLS
+            buffer.append("<th><b>"); //NON-NLS
+            buffer.append(Bundle.ArtifactStringContent_attrsTableHeader_value());
+            buffer.append("</b></th>"); //NON-NLS
+            buffer.append("<th><b>"); //NON-NLS
+            buffer.append(Bundle.ArtifactStringContent_attrsTableHeader_sources());
+            buffer.append("</b></th>"); //NON-NLS
+            buffer.append("</tr>\n"); //NON-NLS
             try {
-                StringBuilder buffer = new StringBuilder();
-                buffer.append("<html>\n"); //NON-NLS
-                buffer.append("<body>\n"); //NON-NLS
+                Content content = artifact.getSleuthkitCase().getContentById(artifact.getObjectID());
 
-                // artifact name header
-                buffer.append("<h4>"); //NON-NLS
-                buffer.append(artifact.getDisplayName());
-                buffer.append("</h4>\n"); //NON-NLS
-
-                // start table for attributes
-                buffer.append("<table border='0'>"); //NON-NLS
-                buffer.append("<tr>"); //NON-NLS
-                buffer.append("</tr>\n"); //NON-NLS
-
-                // cycle through each attribute and display in a row in the table.
+                /*
+                 * Add rows for each attribute.
+                 */
                 for (BlackboardAttribute attr : artifact.getAttributes()) {
 
-                    // name column
-                    buffer.append("<tr><td>"); //NON-NLS
-                    buffer.append(attr.getAttributeType().getDisplayName());
-                    buffer.append("</td>"); //NON-NLS
-
-                    // value column
-                    buffer.append("<td>"); //NON-NLS
+                    /*
+                     * Attribute value column.
+                     */
+                    String value = "";
                     switch (attr.getAttributeType().getValueType()) {
                         case STRING:
-                            String str = attr.getValueString();
-                            str = str.replaceAll(" ", "&nbsp;"); //NON-NLS
-                            str = str.replaceAll("<", "&lt;"); //NON-NLS
-                            str = str.replaceAll(">", "&gt;"); //NON-NLS
-                            str = str.replaceAll("(\r\n|\n)", "<br />"); //NON-NLS
-                            buffer.append(str);
-                            break;
                         case INTEGER:
                         case LONG:
                         case DOUBLE:
                         case BYTE:
-                            buffer.append(attr.getDisplayString());
+                        default:
+                            value = attr.getDisplayString();
                             break;
+                            
+                        // Use Autopsy date formatting settings, not TSK defaults
                         case DATETIME:
                             long epoch = attr.getValueLong();
-                            String time = "0000-00-00 00:00:00";
-                            if (epoch != 0) {
-                                dateFormatter.setTimeZone(getTimeZone(artifact));
-                                time = dateFormatter.format(new java.util.Date(epoch * 1000));
+                            value = "0000-00-00 00:00:00";
+                            if (null != content && 0 != epoch) {
+                                dateFormatter.setTimeZone(ContentUtils.getTimeZone(content));
+                                value = dateFormatter.format(new java.util.Date(epoch * 1000));
                             }
-                            buffer.append(time);
                             break;
                     }
-                    if (!"".equals(attr.getContext())) {
-                        buffer.append(" (");
-                        buffer.append(attr.getContext());
-                        buffer.append(")");
-                    }
-                    buffer.append("</td>"); //NON-NLS
-                    buffer.append("</tr>\n"); //NON-NLS
+
+                    /*
+                     * Attribute sources column.
+                     */
+                    String sources = StringUtils.join(attr.getSources(), ", ");
+                    buffer.append(makeTableRow(attr.getAttributeType().getDisplayName(), value, sources));
                 }
 
-                final Content content = getAssociatedContent(artifact);
+                /*
+                 * Add a row for the source content path.
+                 */
 
                 String path = "";
                 try {
-                    path = content.getUniquePath();
+                    if (null != content) {
+                        path = content.getUniquePath();
+                    }
                 } catch (TskCoreException ex) {
-                    logger.log(Level.SEVERE, "Exception while calling Content.getUniquePath() on {0} : {1}", new Object[]{content, ex.getLocalizedMessage()}); //NON-NLS
+                    logger.log(Level.SEVERE, String.format("Error getting source content path for artifact (artifact_id=%d, obj_id=%d)", artifact.getArtifactID(), artifact.getObjectID()), ex);
+                    path = Bundle.ArtifactStringContent_failedToGetSourcePath_message();
                 }
+                
+                buffer.append(makeTableRow(NbBundle.getMessage(this.getClass(), "ArtifactStringContent.getStr.srcFilePath.text"),
+                        path, ""));
 
-                //add file path
-                buffer.append("<tr>"); //NON-NLS
-                buffer.append("<td>"); //NON-NLS
-                buffer.append(NbBundle.getMessage(this.getClass(), "ArtifactStringContent.getStr.srcFilePath.text"));
-                buffer.append("</td>"); //NON-NLS
-                buffer.append("<td>"); //NON-NLS
-                buffer.append(path);
-                buffer.append("</td>"); //NON-NLS
-                buffer.append("</tr>\n"); //NON-NLS
 
-                // add artifact ID (useful for debugging)
-                buffer.append("<tr><td>"); //NON-NLS
-                buffer.append(NbBundle.getMessage(this.getClass(), "ArtifactStringContent.getStr.artifactId.text"));
-                buffer.append("</td><td>"); //NON-NLS
-                buffer.append(artifact.getArtifactID());
-                buffer.append("</td>"); //NON-NLS
-                buffer.append("</tr>\n"); //NON-NLS
+                /*
+                 * Add a row for the artifact id.
+                 */               
+                buffer.append(makeTableRow(NbBundle.getMessage(this.getClass(), "ArtifactStringContent.getStr.artifactId.text"),
+                        Long.toString(artifact.getArtifactID()), ""));
 
+            } catch (TskCoreException ex) {
+                logger.log(Level.SEVERE, String.format("Error getting data for artifact (artifact_id=%d)", artifact.getArtifactID()), ex);
+                buffer.append(makeTableRow(Bundle.ArtifactStringContent_failedToGetAttributes_message(), "", ""));                
+            } finally {
+                /*
+                 * Finish the document
+                 */
                 buffer.append("</table>"); //NON-NLS
                 buffer.append("</html>\n"); //NON-NLS
-
                 stringContent = buffer.toString();
-            } catch (TskException ex) {
-                stringContent = NbBundle.getMessage(this.getClass(), "ArtifactStringContent.getStr.err");
             }
         }
 
         return stringContent;
     }
-
-    private static Content getAssociatedContent(BlackboardArtifact artifact) {
-        try {
-            return artifact.getSleuthkitCase().getContentById(artifact.getObjectID());
-        } catch (TskException ex) {
-            logger.log(Level.WARNING, "Getting file failed", ex); //NON-NLS
-        }
-        throw new IllegalArgumentException(NbBundle.getMessage(ArtifactStringContent.class, "ArtifactStringContent.exception.msg"));
+    
+    // escape special HTML characters
+    private String escapeHtmlString(String str) {
+        str = str.replaceAll(" ", "&nbsp;"); //NON-NLS
+        str = str.replaceAll("<", "&lt;"); //NON-NLS
+        str = str.replaceAll(">", "&gt;"); //NON-NLS
+        str = str.replaceAll("(\r\n|\n)", "<br />"); //NON-NLS
+        return str;
+    }
+    
+    /**
+     * Make a row in the result table
+     * @param type String for column1 (Type of attribute))
+     * @param value String for column2 (value of attribute)
+     * @param source Column 3 (attribute source)
+     * @return  HTML formatted string of these values
+     */
+    private String makeTableRow(String type, String value, String source) {
+        String row = "<tr><td>" + escapeHtmlString(type) + "</td><td>" + escapeHtmlString(value) + "</td><td>" + escapeHtmlString(source) + "</td></tr>";
+        return row;
     }
 
-    private static TimeZone getTimeZone(BlackboardArtifact artifact) {
-        return ContentUtils.getTimeZone(getAssociatedContent(artifact));
-
-    }
 }

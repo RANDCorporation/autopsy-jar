@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,10 +18,8 @@
  */
 package org.sleuthkit.autopsy.casemodule;
 
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Font;
+import java.io.File;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
@@ -29,22 +27,23 @@ import java.util.SimpleTimeZone;
 import java.util.TimeZone;
 import java.util.concurrent.CancellationException;
 import java.util.logging.Level;
-import javax.swing.ComboBoxModel;
-import javax.swing.JLabel;
-import javax.swing.JList;
+import javax.swing.JFileChooser;
 import javax.swing.JPanel;
-import javax.swing.JSeparator;
-import javax.swing.ListCellRenderer;
 import javax.swing.SwingWorker;
-import javax.swing.border.EmptyBorder;
-import javax.swing.event.ListDataListener;
+import javax.swing.event.ListSelectionEvent;
+import javax.swing.event.ListSelectionListener;
+import javax.swing.event.TableModelListener;
+import javax.swing.table.TableModel;
 import org.openide.util.NbBundle;
 import org.sleuthkit.autopsy.corecomponentinterfaces.DataSourceProcessor;
 import org.sleuthkit.autopsy.coreutils.LocalDisk;
 import org.sleuthkit.autopsy.coreutils.Logger;
 import org.sleuthkit.autopsy.coreutils.MessageNotifyUtil;
 import org.sleuthkit.autopsy.coreutils.PlatformUtil;
+import org.sleuthkit.autopsy.imagewriter.ImageWriterSettings;
 
+@NbBundle.Messages({"LocalDiskPanel.refreshTablebutton.text=Refresh Local Disks"
+})
 /**
  * ImageTypePanel for adding a local disk or partition such as PhysicalDrive0 or
  * C:.
@@ -55,24 +54,54 @@ final class LocalDiskPanel extends JPanel {
     private static LocalDiskPanel instance;
     private static final long serialVersionUID = 1L;
     private List<LocalDisk> disks;
-    private LocalDiskModel model;
     private boolean enableNext = false;
+    private final LocalDiskModel model;
+    private final JFileChooser fc = new JFileChooser();
 
     /**
      * Creates new form LocalDiskPanel
      */
-    public LocalDiskPanel() {
+    LocalDiskPanel() {
+        this.model = new LocalDiskModel();
+
         this.disks = new ArrayList<>();
         initComponents();
         customInit();
-
         createTimeZoneList();
+        refreshTable();
+        diskTable.getSelectionModel().addListSelectionListener(new ListSelectionListener() {
+            @Override
+            public void valueChanged(ListSelectionEvent e) {
+                if (diskTable.getSelectedRow() >= 0 && diskTable.getSelectedRow() < disks.size()) {
+                    enableNext = true;
+                    setPotentialImageWriterPath(disks.get(diskTable.getSelectedRow()));
+                    try {
+                        firePropertyChange(DataSourceProcessor.DSP_PANEL_EVENT.UPDATE_UI.toString(), false, true);
+                    } catch (Exception ex) {
+                        logger.log(Level.SEVERE, "LocalDiskPanel listener threw exception", e); //NON-NLS
+                        MessageNotifyUtil.Notify.show(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr"),
+                                NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr.msg"),
+                                MessageNotifyUtil.MessageType.ERROR);
+                    }
+                } else {  //The selection changed to nothing valid being selected, such as with ctrl+click
+                    enableNext = false;
+                    try {
+                        firePropertyChange(DataSourceProcessor.DSP_PANEL_EVENT.UPDATE_UI.toString(), false, true);
+                    } catch (Exception ex) {
+                        logger.log(Level.SEVERE, "LocalDiskPanel listener threw exception", e); //NON-NLS
+                        MessageNotifyUtil.Notify.show(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr"),
+                                NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr.msg"),
+                                MessageNotifyUtil.MessageType.ERROR);
+                    }
+                }
+            }
+        });
     }
 
     /**
      * Get the default instance of this panel.
      */
-    public static synchronized LocalDiskPanel getDefault() {
+    static synchronized LocalDiskPanel getDefault() {
         if (instance == null) {
             instance = new LocalDiskPanel();
         }
@@ -81,13 +110,18 @@ final class LocalDiskPanel extends JPanel {
 
     @SuppressWarnings("unchecked")
     private void customInit() {
-        model = new LocalDiskModel();
-        diskComboBox.setModel(model);
-        diskComboBox.setRenderer(model);
-
         errorLabel.setVisible(false);
         errorLabel.setText("");
-        diskComboBox.setEnabled(false);
+        diskTable.setEnabled(false);
+        imageWriterErrorLabel.setVisible(false);
+        imageWriterErrorLabel.setText("");
+        if(! PlatformUtil.isWindowsOS()){
+            copyImageCheckbox.setSelected(false);
+            copyImageCheckbox.setEnabled(false);
+        }
+        pathTextField.setEnabled(copyImageCheckbox.isSelected());
+        browseButton.setEnabled(copyImageCheckbox.isSelected());
+        changeDatabasePathCheckbox.setEnabled(copyImageCheckbox.isSelected());
     }
 
     /**
@@ -100,20 +134,26 @@ final class LocalDiskPanel extends JPanel {
     private void initComponents() {
 
         diskLabel = new javax.swing.JLabel();
-        diskComboBox = new javax.swing.JComboBox<>();
         errorLabel = new javax.swing.JLabel();
         timeZoneLabel = new javax.swing.JLabel();
         timeZoneComboBox = new javax.swing.JComboBox<>();
         noFatOrphansCheckbox = new javax.swing.JCheckBox();
         descLabel = new javax.swing.JLabel();
+        jScrollPane1 = new javax.swing.JScrollPane();
+        diskTable = new javax.swing.JTable();
+        copyImageCheckbox = new javax.swing.JCheckBox();
+        pathTextField = new javax.swing.JTextField();
+        browseButton = new javax.swing.JButton();
+        jLabel1 = new javax.swing.JLabel();
+        imageWriterErrorLabel = new javax.swing.JLabel();
+        changeDatabasePathCheckbox = new javax.swing.JCheckBox();
+        refreshTablebutton = new javax.swing.JButton();
 
-        setMinimumSize(new java.awt.Dimension(0, 65));
-        setPreferredSize(new java.awt.Dimension(485, 65));
+        setMinimumSize(new java.awt.Dimension(0, 420));
+        setPreferredSize(new java.awt.Dimension(485, 410));
 
         diskLabel.setFont(diskLabel.getFont().deriveFont(diskLabel.getFont().getStyle() & ~java.awt.Font.BOLD, 11));
         org.openide.awt.Mnemonics.setLocalizedText(diskLabel, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.diskLabel.text")); // NOI18N
-
-        diskComboBox.setFont(diskComboBox.getFont().deriveFont(diskComboBox.getFont().getStyle() & ~java.awt.Font.BOLD, 11));
 
         errorLabel.setFont(errorLabel.getFont().deriveFont(errorLabel.getFont().getStyle() & ~java.awt.Font.BOLD, 11));
         errorLabel.setForeground(new java.awt.Color(255, 0, 0));
@@ -132,80 +172,200 @@ final class LocalDiskPanel extends JPanel {
         descLabel.setFont(descLabel.getFont().deriveFont(descLabel.getFont().getStyle() & ~java.awt.Font.BOLD, 11));
         org.openide.awt.Mnemonics.setLocalizedText(descLabel, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.descLabel.text")); // NOI18N
 
+        diskTable.setModel(model);
+        diskTable.setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
+        jScrollPane1.setViewportView(diskTable);
+
+        org.openide.awt.Mnemonics.setLocalizedText(copyImageCheckbox, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.copyImageCheckbox.text")); // NOI18N
+        copyImageCheckbox.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                copyImageCheckboxActionPerformed(evt);
+            }
+        });
+
+        pathTextField.setText(org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.pathTextField.text")); // NOI18N
+        pathTextField.addKeyListener(new java.awt.event.KeyAdapter() {
+            public void keyReleased(java.awt.event.KeyEvent evt) {
+                pathTextFieldKeyReleased(evt);
+            }
+        });
+
+        org.openide.awt.Mnemonics.setLocalizedText(browseButton, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.browseButton.text")); // NOI18N
+        browseButton.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                browseButtonActionPerformed(evt);
+            }
+        });
+
+        org.openide.awt.Mnemonics.setLocalizedText(jLabel1, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.jLabel1.text")); // NOI18N
+
+        imageWriterErrorLabel.setFont(imageWriterErrorLabel.getFont().deriveFont(imageWriterErrorLabel.getFont().getStyle() & ~java.awt.Font.BOLD, 11));
+        imageWriterErrorLabel.setForeground(new java.awt.Color(255, 0, 0));
+        org.openide.awt.Mnemonics.setLocalizedText(imageWriterErrorLabel, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.imageWriterErrorLabel.text")); // NOI18N
+
+        org.openide.awt.Mnemonics.setLocalizedText(changeDatabasePathCheckbox, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.changeDatabasePathCheckbox.text")); // NOI18N
+
+        org.openide.awt.Mnemonics.setLocalizedText(refreshTablebutton, org.openide.util.NbBundle.getMessage(LocalDiskPanel.class, "LocalDiskPanel.refreshTablebutton.text")); // NOI18N
+        refreshTablebutton.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                refreshTablebuttonActionPerformed(evt);
+            }
+        });
+
         javax.swing.GroupLayout layout = new javax.swing.GroupLayout(this);
         this.setLayout(layout);
         layout.setHorizontalGroup(
             layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
             .addGroup(layout.createSequentialGroup()
                 .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
-                    .addComponent(diskLabel)
-                    .addComponent(diskComboBox, javax.swing.GroupLayout.PREFERRED_SIZE, 345, javax.swing.GroupLayout.PREFERRED_SIZE)
-                    .addComponent(errorLabel)
                     .addGroup(layout.createSequentialGroup()
-                        .addComponent(timeZoneLabel)
-                        .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
-                        .addComponent(timeZoneComboBox, javax.swing.GroupLayout.PREFERRED_SIZE, 215, javax.swing.GroupLayout.PREFERRED_SIZE))
-                    .addComponent(noFatOrphansCheckbox)
+                        .addContainerGap()
+                        .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
+                            .addGroup(layout.createSequentialGroup()
+                                .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
+                                    .addComponent(noFatOrphansCheckbox)
+                                    .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.TRAILING)
+                                        .addComponent(copyImageCheckbox)
+                                        .addComponent(descLabel))
+                                    .addGroup(layout.createSequentialGroup()
+                                        .addGap(21, 21, 21)
+                                        .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING, false)
+                                            .addGroup(layout.createSequentialGroup()
+                                                .addComponent(pathTextField, javax.swing.GroupLayout.PREFERRED_SIZE, 342, javax.swing.GroupLayout.PREFERRED_SIZE)
+                                                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                                                .addComponent(browseButton, javax.swing.GroupLayout.DEFAULT_SIZE, 92, Short.MAX_VALUE))
+                                            .addGroup(layout.createSequentialGroup()
+                                                .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
+                                                    .addComponent(imageWriterErrorLabel)
+                                                    .addComponent(jLabel1)
+                                                    .addComponent(changeDatabasePathCheckbox))
+                                                .addGap(0, 0, Short.MAX_VALUE)))))
+                                .addGap(0, 0, Short.MAX_VALUE))
+                            .addGroup(layout.createSequentialGroup()
+                                .addComponent(timeZoneLabel)
+                                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
+                                .addComponent(timeZoneComboBox, 0, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE))))
+                    .addComponent(jScrollPane1, javax.swing.GroupLayout.Alignment.TRAILING, javax.swing.GroupLayout.DEFAULT_SIZE, 488, Short.MAX_VALUE)
+                    .addGroup(javax.swing.GroupLayout.Alignment.TRAILING, layout.createSequentialGroup()
+                        .addGap(0, 0, Short.MAX_VALUE)
+                        .addComponent(refreshTablebutton, javax.swing.GroupLayout.PREFERRED_SIZE, 129, javax.swing.GroupLayout.PREFERRED_SIZE))
                     .addGroup(layout.createSequentialGroup()
-                        .addGap(21, 21, 21)
-                        .addComponent(descLabel)))
-                .addGap(0, 102, Short.MAX_VALUE))
+                        .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
+                            .addComponent(diskLabel)
+                            .addComponent(errorLabel))
+                        .addGap(0, 0, Short.MAX_VALUE)))
+                .addContainerGap())
         );
         layout.setVerticalGroup(
             layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
             .addGroup(layout.createSequentialGroup()
                 .addComponent(diskLabel)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-                .addComponent(diskComboBox, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
-                .addGap(13, 13, 13)
-                .addComponent(errorLabel)
-                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
+                .addComponent(jScrollPane1, javax.swing.GroupLayout.PREFERRED_SIZE, 100, javax.swing.GroupLayout.PREFERRED_SIZE)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(refreshTablebutton)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
                     .addComponent(timeZoneLabel)
                     .addComponent(timeZoneComboBox, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))
-                .addGap(18, 18, 18)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
                 .addComponent(noFatOrphansCheckbox)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addComponent(descLabel)
-                .addContainerGap(javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE))
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
+                .addComponent(copyImageCheckbox)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.TRAILING)
+                    .addComponent(browseButton)
+                    .addComponent(pathTextField, javax.swing.GroupLayout.PREFERRED_SIZE, 23, javax.swing.GroupLayout.PREFERRED_SIZE))
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
+                .addComponent(changeDatabasePathCheckbox)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(jLabel1)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(imageWriterErrorLabel)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(errorLabel)
+                .addContainerGap(58, Short.MAX_VALUE))
         );
     }// </editor-fold>//GEN-END:initComponents
+
+    private void copyImageCheckboxActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_copyImageCheckboxActionPerformed
+        pathTextField.setEnabled(copyImageCheckbox.isSelected());
+        browseButton.setEnabled(copyImageCheckbox.isSelected());
+        changeDatabasePathCheckbox.setEnabled(copyImageCheckbox.isSelected());
+        fireUpdateEvent();
+    }//GEN-LAST:event_copyImageCheckboxActionPerformed
+
+    private void pathTextFieldKeyReleased(java.awt.event.KeyEvent evt) {//GEN-FIRST:event_pathTextFieldKeyReleased
+        fireUpdateEvent();
+    }//GEN-LAST:event_pathTextFieldKeyReleased
+
+    private void browseButtonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_browseButtonActionPerformed
+        String oldText = pathTextField.getText();
+        // set the current directory of the FileChooser if the ImagePath Field is valid
+        File currentFile = new File(oldText);
+        if ((currentFile.getParentFile() != null) && (currentFile.getParentFile().exists())) {
+            fc.setSelectedFile(currentFile);
+        }
+
+        int retval = fc.showOpenDialog(this);
+        if (retval == JFileChooser.APPROVE_OPTION) {
+            String path = fc.getSelectedFile().getPath();
+            pathTextField.setText(path);
+        }
+        fireUpdateEvent();
+    }//GEN-LAST:event_browseButtonActionPerformed
+
+    private void refreshTablebuttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_refreshTablebuttonActionPerformed
+        refreshTable();
+    }//GEN-LAST:event_refreshTablebuttonActionPerformed
+
     // Variables declaration - do not modify//GEN-BEGIN:variables
+    private javax.swing.JButton browseButton;
+    private javax.swing.JCheckBox changeDatabasePathCheckbox;
+    private javax.swing.JCheckBox copyImageCheckbox;
     private javax.swing.JLabel descLabel;
-    private javax.swing.JComboBox<LocalDisk> diskComboBox;
     private javax.swing.JLabel diskLabel;
+    private javax.swing.JTable diskTable;
     private javax.swing.JLabel errorLabel;
+    private javax.swing.JLabel imageWriterErrorLabel;
+    private javax.swing.JLabel jLabel1;
+    private javax.swing.JScrollPane jScrollPane1;
     private javax.swing.JCheckBox noFatOrphansCheckbox;
+    private javax.swing.JTextField pathTextField;
+    private javax.swing.JButton refreshTablebutton;
     private javax.swing.JComboBox<String> timeZoneComboBox;
     private javax.swing.JLabel timeZoneLabel;
     // End of variables declaration//GEN-END:variables
+
+    private void fireUpdateEvent() {
+        try {
+            firePropertyChange(DataSourceProcessor.DSP_PANEL_EVENT.UPDATE_UI.toString(), false, true);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "LocalDiskPanel listener threw exception", e); //NON-NLS
+            MessageNotifyUtil.Notify.show(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr"),
+                    NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr.msg"),
+                    MessageNotifyUtil.MessageType.ERROR);
+        }
+    }
 
     /**
      * Return the currently selected disk path.
      *
      * @return String selected disk path
      */
-    public String getContentPaths() {
+    String getContentPaths() {
         if (disks.size() > 0) {
-            LocalDisk selected = (LocalDisk) diskComboBox.getSelectedItem();
+            int selectedRow = diskTable.getSelectedRow();
+            LocalDisk selected = disks.get(selectedRow);
             return selected.getPath();
         } else {
             return "";
         }
     }
 
-    /**
-     * Set the selected disk.
-     */
-    public void setContentPath(String s) {
-        for (int i = 0; i < disks.size(); i++) {
-            if (disks.get(i).getPath().equals(s)) {
-                diskComboBox.setSelectedIndex(i);
-            }
-        }
-    }
-
-    public String getTimeZone() {
+    String getTimeZone() {
         String tz = timeZoneComboBox.getSelectedItem().toString();
         return tz.substring(tz.indexOf(")") + 2).trim();
 
@@ -215,25 +375,91 @@ final class LocalDiskPanel extends JPanel {
         return noFatOrphansCheckbox.isSelected();
     }
 
+    private static String getDefaultImageWriterFolder() {
+        return Paths.get(Case.getCurrentCase().getModuleDirectory(), "Image Writer").toString();
+    }
+
+    private void setPotentialImageWriterPath(LocalDisk disk) {
+
+        File subDirectory = Paths.get(getDefaultImageWriterFolder()).toFile();
+        if (!subDirectory.exists()) {
+            subDirectory.mkdirs();
+        }
+
+        String path = disk.getName();
+
+        // Remove any character that isn't alphanumeric, a space, parent, or underscore.
+        // If the name ends up empty or starting with a space, prepend "localDisk"
+        path = path.replaceAll("[^0-9A-Za-z _()]", ""); // NON-NLS
+        if (path.isEmpty() || path.startsWith(" ")) {
+            path = "localDisk" + path;
+        }
+
+        path += " " + System.currentTimeMillis();
+        path += ".vhd";
+        pathTextField.setText(Paths.get(getDefaultImageWriterFolder(), path).toString());
+    }
+
+    private boolean imageWriterPathIsValid() {
+        if ((!copyImageCheckbox.isSelected()) || !(diskTable.getSelectedRow() >= 0 && diskTable.getSelectedRow() < disks.size())) {
+            imageWriterErrorLabel.setVisible(false);
+            imageWriterErrorLabel.setText("");
+            return true;
+        }
+
+        if (pathTextField.getText().isEmpty()) {
+            imageWriterErrorLabel.setVisible(true);
+            imageWriterErrorLabel.setText(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.imageWriterEmptyPathError.text"));
+            return false;
+        }
+
+        File f = new File(pathTextField.getText());
+        if (((f.getParentFile() != null) && (!f.getParentFile().exists()))
+                || (f.getParentFile() == null)) {
+            imageWriterErrorLabel.setVisible(true);
+            imageWriterErrorLabel.setText(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.imageWriterDirError.text"));
+            return false;
+        }
+        if (f.isDirectory()) {
+            imageWriterErrorLabel.setVisible(true);
+            imageWriterErrorLabel.setText(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.imageWriterIsDirError.text"));
+            return false;
+        }
+        if (f.exists()) {
+            imageWriterErrorLabel.setVisible(true);
+            imageWriterErrorLabel.setText(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.imageWriterFileExistsError.text"));
+            return false;
+        }
+        imageWriterErrorLabel.setVisible(false);
+        imageWriterErrorLabel.setText("");
+        return true;
+    }
+
+    boolean getImageWriterEnabled() {
+        return copyImageCheckbox.isSelected();
+    }
+
+    ImageWriterSettings getImageWriterSettings() {
+        return new ImageWriterSettings(pathTextField.getText(), changeDatabasePathCheckbox.isSelected());
+    }
+
     /**
-     * Should we enable the wizard's next button? Always return true because we
-     * control the possible selections.
+     * Should we enable the wizard's next button? We control all the possible
+     * selections except for Image Writer.
      *
-     * @return true
+     * @return true if panel is valid
      */
-    public boolean validatePanel() {
+    boolean validatePanel() {
+        if (!imageWriterPathIsValid()) {
+            return false;
+        }
         return enableNext;
     }
 
-    public void reset() {
-        //nothing to reset
-    }
-
     /**
-     * Set the focus to the diskComboBox and refreshes the list of disks.
+     * Refreshes the list of disks in the table.
      */
-    public void select() {
-        diskComboBox.requestFocusInWindow();
+    public void refreshTable() {
         model.loadDisks();
     }
 
@@ -271,25 +497,21 @@ final class LocalDiskPanel extends JPanel {
 
         // set the selected timezone
         timeZoneComboBox.setSelectedItem(formatted);
+
     }
 
-    @SuppressWarnings("rawtypes")
-    private class LocalDiskModel implements ComboBoxModel, ListCellRenderer {
+    /**
+     * Table model for displaing information from LocalDisk Objects in a table.
+     */
+    private class LocalDiskModel implements TableModel {
 
-        private Object selected;
-
+        private LocalDiskThread worker = null;
         private boolean ready = false;
-
         private volatile boolean loadingDisks = false;
-
-        List<LocalDisk> physicalDrives = new ArrayList<>();
-        List<LocalDisk> partitions = new ArrayList<>();
 
         //private String SELECT = "Select a local disk:";
         private final String LOADING = NbBundle.getMessage(this.getClass(), "LocalDiskPanel.localDiskModel.loading.msg");
         private final String NO_DRIVES = NbBundle.getMessage(this.getClass(), "LocalDiskPanel.localDiskModel.nodrives.msg");
-
-        LocalDiskThread worker = null;
 
         private void loadDisks() {
 
@@ -300,125 +522,112 @@ final class LocalDiskPanel extends JPanel {
 
             // Clear the lists
             errorLabel.setText("");
-            disks = new ArrayList<>();
-            physicalDrives = new ArrayList<>();
-            partitions = new ArrayList<>();
-            diskComboBox.setEnabled(false);
+            diskTable.setEnabled(false);
             ready = false;
             enableNext = false;
             loadingDisks = true;
-
             worker = new LocalDiskThread();
             worker.execute();
-
         }
 
         @Override
-        public void setSelectedItem(Object anItem) {
-            if (ready) {
-                selected = (LocalDisk) anItem;
-                enableNext = true;
+        public int getRowCount() {
+            if (disks.isEmpty()) {
+                return 0;
+            }
+            return disks.size();
+        }
 
-                try {
-                    firePropertyChange(DataSourceProcessor.DSP_PANEL_EVENT.UPDATE_UI.toString(), false, true);
-                } catch (Exception e) {
-                    logger.log(Level.SEVERE, "LocalDiskPanel listener threw exception", e); //NON-NLS
-                    MessageNotifyUtil.Notify.show(NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr"),
-                            NbBundle.getMessage(this.getClass(), "LocalDiskPanel.moduleErr.msg"),
-                            MessageNotifyUtil.MessageType.ERROR);
-                }
+        @Override
+        public int getColumnCount() {
+            return 2;
+
+        }
+
+        @NbBundle.Messages({"LocalDiskPanel.diskTable.column1.title=Disk Name",
+            "LocalDiskPanel.diskTable.column2.title=Disk Size"
+        })
+
+        @Override
+        public String getColumnName(int columnIndex) {
+            switch (columnIndex) {
+                case 0:
+                    return NbBundle.getMessage(this.getClass(), "LocalDiskPanel.diskTable.column1.title");
+                case 1:
+                    return NbBundle.getMessage(this.getClass(), "LocalDiskPanel.diskTable.column2.title");
+                default:
+                    return "Unnamed"; //NON-NLS  
             }
         }
 
         @Override
-        public Object getSelectedItem() {
+        public Class<?> getColumnClass(int columnIndex) {
+            return String.class;
+        }
+
+        @Override
+        public boolean isCellEditable(int rowIndex, int columnIndex) {
+            return false;
+        }
+
+        @Override
+        public Object getValueAt(int rowIndex, int columnIndex) {
             if (ready) {
                 if (disks.isEmpty()) {
                     return NO_DRIVES;
                 }
-                return selected;
+                switch (columnIndex) {
+                    case 0:
+                        return disks.get(rowIndex).getName();
+                    case 1:
+                        return disks.get(rowIndex).getReadableSize();
+                    default:
+                        return disks.get(rowIndex).getPath();
+                }
             } else {
                 return LOADING;
             }
         }
 
         @Override
-        public int getSize() {
-            if (ready) {
-                if (disks.isEmpty()) {
-                    return 1;
-                }
-                return disks.size();
-            } else {
-                return 1;
-            }
+        public void setValueAt(Object aValue, int rowIndex, int columnIndex) {
+            //setter does nothing they should not be able to modify table
         }
 
         @Override
-        public Object getElementAt(int index) {
-            if (ready) {
-                if (disks.isEmpty()) {
-                    return NO_DRIVES;
-                }
-                return disks.get(index);
-            } else {
-                return LOADING;
-            }
+        public void addTableModelListener(TableModelListener l) {
+
         }
 
         @Override
-        public void addListDataListener(ListDataListener l) {
+        public void removeTableModelListener(TableModelListener l) {
+
         }
 
-        @Override
-        public void removeListDataListener(ListDataListener l) {
-        }
-
-        @SuppressWarnings("rawtypes")
-        @Override
-        public Component getListCellRendererComponent(JList list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
-            JPanel panel = new JPanel(new BorderLayout());
-            JLabel label = new JLabel();
-            if ((index == physicalDrives.size() - 1) && (physicalDrives.size() > 0)) {
-                panel.add(new JSeparator(JSeparator.HORIZONTAL), BorderLayout.SOUTH);
-            }
-
-            if (isSelected) {
-                label.setBackground(list.getSelectionBackground());
-                label.setForeground(list.getSelectionForeground());
-            } else {
-                label.setBackground(list.getBackground());
-                label.setForeground(list.getForeground());
-            }
-
-            if (value != null) {
-                String localDiskString = value.toString();
-                label.setText(value.toString());
-                if ((localDiskString.equals(LOADING)) || (localDiskString.equals(NO_DRIVES))) {
-                    label.setFont(label.getFont().deriveFont(Font.ITALIC));
-                    label.setBackground(Color.GRAY);
-                }
-            }
-            label.setOpaque(true);
-            label.setBorder(new EmptyBorder(2, 2, 2, 2));
-
-            panel.add(label, BorderLayout.CENTER);
-            return panel;
-        }
-
+        /**
+         * Gets the lists of physical drives and partitions and combines them
+         * into a list of disks.
+         */
         class LocalDiskThread extends SwingWorker<Object, Void> {
 
             private final Logger logger = Logger.getLogger(LocalDiskThread.class.getName());
+            private List<LocalDisk> physicalDrives = new ArrayList<>();
+            private List<LocalDisk> partitions = new ArrayList<>();
 
             @Override
             protected Object doInBackground() throws Exception {
                 // Populate the lists
+                physicalDrives = new ArrayList<>();
+                partitions = new ArrayList<>();
                 physicalDrives = PlatformUtil.getPhysicalDrives();
                 partitions = PlatformUtil.getPartitions();
-
                 return null;
             }
 
+            /**
+             * Display any error messages that might of occurred when getting
+             * the lists of physical drives or partitions.
+             */
             private void displayErrors() {
                 if (physicalDrives.isEmpty() && partitions.isEmpty()) {
                     if (PlatformUtil.isWindowsOS()) {
@@ -432,12 +641,14 @@ final class LocalDiskPanel extends JPanel {
                         errorLabel.setToolTipText(NbBundle.getMessage(this.getClass(),
                                 "LocalDiskPanel.errLabel.drivesNotDetected.toolTipText"));
                     }
-                    diskComboBox.setEnabled(false);
+                    errorLabel.setVisible(true);
+                    diskTable.setEnabled(false);
                 } else if (physicalDrives.isEmpty()) {
                     errorLabel.setText(
                             NbBundle.getMessage(this.getClass(), "LocalDiskPanel.errLabel.someDisksNotDetected.text"));
                     errorLabel.setToolTipText(NbBundle.getMessage(this.getClass(),
                             "LocalDiskPanel.errLabel.someDisksNotDetected.toolTipText"));
+                    errorLabel.setVisible(true);
                 }
             }
 
@@ -446,7 +657,7 @@ final class LocalDiskPanel extends JPanel {
                 try {
                     super.get(); //block and get all exceptions thrown while doInBackground()
                 } catch (CancellationException ex) {
-                    logger.log(Level.INFO, "Loading local disks was canceled, which should not be possible."); //NON-NLS
+                    logger.log(Level.INFO, "Loading local disks was canceled."); //NON-NLS
                 } catch (InterruptedException ex) {
                     logger.log(Level.INFO, "Loading local disks was interrupted."); //NON-NLS
                 } catch (Exception ex) {
@@ -455,22 +666,21 @@ final class LocalDiskPanel extends JPanel {
                     if (!this.isCancelled()) {
                         enableNext = false;
                         displayErrors();
-
                         worker = null;
                         loadingDisks = false;
-
+                        disks = new ArrayList<>();
                         disks.addAll(physicalDrives);
                         disks.addAll(partitions);
-
                         if (disks.size() > 0) {
-                            diskComboBox.setEnabled(true);
-                            diskComboBox.setSelectedIndex(0);
+                            diskTable.setEnabled(true);
+                            diskTable.clearSelection();
                         }
+                        pathTextField.setText("");
+                        fireUpdateEvent();
                         ready = true;
-                    } else {
-                        logger.log(Level.INFO, "Loading local disks was canceled, which should not be possible."); //NON-NLS
                     }
                 }
+                diskTable.revalidate();
             }
         }
     }

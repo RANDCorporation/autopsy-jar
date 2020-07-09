@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2014 Basis Technology Corp.
+ * Copyright 2014-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@ package org.sleuthkit.autopsy.modules.interestingitems;
 import org.openide.DialogDisplayer;
 import org.openide.NotifyDescriptor;
 import org.openide.util.NbBundle;
+import org.sleuthkit.autopsy.modules.interestingitems.FilesSetDefsPanel.PANEL_TYPE;
 
 /**
  * A panel that allows a user to create and edit interesting files set
@@ -28,11 +29,31 @@ import org.openide.util.NbBundle;
  */
 public class FilesSetPanel extends javax.swing.JPanel {
 
+    @NbBundle.Messages({"FilesSetPanel.filter.title=File Filter", "FilesSetPanel.rule.title=File Filter Rule", "FilesSetPanel.ingest.createNewFilter=Create/edit file ingest filters...", "FilesSetPanel.ingest.messages.filtersMustBeNamed=File ingest filters must be named."})
+
+    private static final String CREATE_NEW_FILE_INGEST_FILTER = Bundle.FilesSetPanel_ingest_createNewFilter();
+    private final String mustBeNamedErrorText;
+
+    /**
+     * @return the CREATE_NEW_FILE_INGEST_FILTER
+     */
+    public static String getCreateNewFileIngestFilterString() {
+        return CREATE_NEW_FILE_INGEST_FILTER;
+    }
+
     /**
      * Construct a files set panel in create mode.
      */
-    FilesSetPanel() {
+    FilesSetPanel(PANEL_TYPE panelType) {
         initComponents();
+        if (panelType == PANEL_TYPE.FILE_INGEST_FILTERS) {
+            ignoreKnownFilesCheckbox.setVisible(false);
+            mustBeNamedErrorText = NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.ingest.messages.filtersMustBeNamed");
+            org.openide.awt.Mnemonics.setLocalizedText(nameLabel, org.openide.util.NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.ingest.nameLabel.text")); // NOI18N
+        } else {
+            mustBeNamedErrorText = NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.interesting.messages.filesSetsMustBeNamed");
+            ignoreUnallocCheckbox.setVisible(false);
+        }
     }
 
     /**
@@ -40,11 +61,19 @@ public class FilesSetPanel extends javax.swing.JPanel {
      *
      * @param filesSet The files set to be edited.
      */
-    FilesSetPanel(FilesSet filesSet) {
+    FilesSetPanel(FilesSet filesSet, PANEL_TYPE panelType) {
         initComponents();
+        if (panelType == PANEL_TYPE.FILE_INGEST_FILTERS) {
+            ignoreKnownFilesCheckbox.setVisible(false);
+            mustBeNamedErrorText = NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.ingest.messages.filtersMustBeNamed");
+        } else {
+            ignoreUnallocCheckbox.setVisible(false);
+            mustBeNamedErrorText = NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.interesting.messages.filesSetsMustBeNamed");
+        }
         this.nameTextField.setText(filesSet.getName());
         this.descTextArea.setText(filesSet.getDescription());
         this.ignoreKnownFilesCheckbox.setSelected(filesSet.ignoresKnownFiles());
+        this.ignoreUnallocCheckbox.setSelected(filesSet.ingoresUnallocatedSpace());
     }
 
     /**
@@ -57,10 +86,29 @@ public class FilesSetPanel extends javax.swing.JPanel {
     boolean isValidDefinition() {
         if (this.nameTextField.getText().isEmpty()) {
             NotifyDescriptor notifyDesc = new NotifyDescriptor.Message(
-                    NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.messages.filesSetsMustBeNamed"),
+                    mustBeNamedErrorText,
                     NotifyDescriptor.WARNING_MESSAGE);
             DialogDisplayer.getDefault().notify(notifyDesc);
             return false;
+        } else {
+            // The FileIngestFilters have reserved names for default filter, and creating a new filter from the jComboBox
+            // These names if used would have undefined results, so prohibiting the user from using them is necessary
+            for (FilesSet filesSet : FilesSetsManager.getStandardFileIngestFilters()) {
+                if (this.nameTextField.getText().equals(filesSet.getName())) {
+                    NotifyDescriptor notifyDesc = new NotifyDescriptor.Message(
+                            NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.messages.filesSetsReservedName"),
+                            NotifyDescriptor.WARNING_MESSAGE);
+                    DialogDisplayer.getDefault().notify(notifyDesc);
+                    return false;
+                }
+            }
+            if (this.nameTextField.getText().equals(getCreateNewFileIngestFilterString())) {
+                NotifyDescriptor notifyDesc = new NotifyDescriptor.Message(
+                        NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.messages.filesSetsReservedName"),
+                        NotifyDescriptor.WARNING_MESSAGE);
+                DialogDisplayer.getDefault().notify(notifyDesc);
+                return false;
+            }
         }
         return true;
     }
@@ -71,7 +119,8 @@ public class FilesSetPanel extends javax.swing.JPanel {
      * @return A name string.
      */
     String getFilesSetName() {
-        return this.nameTextField.getText();
+        String returnValue = this.nameTextField.getText();
+        return returnValue;
     }
 
     /**
@@ -95,6 +144,13 @@ public class FilesSetPanel extends javax.swing.JPanel {
     }
 
     /**
+     *
+     */
+    boolean getFileSetIgnoresUnallocatedSpace() {
+        return ignoreUnallocCheckbox.isSelected();
+    }
+
+    /**
      * This method is called from within the constructor to initialize the form.
      * WARNING: Do NOT modify this code. The content of this method is always
      * regenerated by the Form Editor.
@@ -109,13 +165,16 @@ public class FilesSetPanel extends javax.swing.JPanel {
         descScrollPanel = new javax.swing.JScrollPane();
         descTextArea = new javax.swing.JTextArea();
         ignoreKnownFilesCheckbox = new javax.swing.JCheckBox();
+        ignoreUnallocCheckbox = new javax.swing.JCheckBox();
 
-        org.openide.awt.Mnemonics.setLocalizedText(nameLabel, org.openide.util.NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.nameLabel.text")); // NOI18N
+        org.openide.awt.Mnemonics.setLocalizedText(nameLabel, org.openide.util.NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.interesting.nameLabel.text")); // NOI18N
 
         descPanel.setBorder(javax.swing.BorderFactory.createTitledBorder(org.openide.util.NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.descPanel.border.title"))); // NOI18N
 
         descTextArea.setColumns(20);
+        descTextArea.setLineWrap(true);
         descTextArea.setRows(5);
+        descTextArea.setWrapStyleWord(true);
         descScrollPanel.setViewportView(descTextArea);
 
         javax.swing.GroupLayout descPanelLayout = new javax.swing.GroupLayout(descPanel);
@@ -137,6 +196,9 @@ public class FilesSetPanel extends javax.swing.JPanel {
 
         org.openide.awt.Mnemonics.setLocalizedText(ignoreKnownFilesCheckbox, org.openide.util.NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.ignoreKnownFilesCheckbox.text")); // NOI18N
 
+        org.openide.awt.Mnemonics.setLocalizedText(ignoreUnallocCheckbox, org.openide.util.NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.ignoreUnallocCheckbox.text")); // NOI18N
+        ignoreUnallocCheckbox.setToolTipText(org.openide.util.NbBundle.getMessage(FilesSetPanel.class, "FilesSetPanel.ignoreUnallocCheckbox.toolTipText")); // NOI18N
+
         javax.swing.GroupLayout layout = new javax.swing.GroupLayout(this);
         this.setLayout(layout);
         layout.setHorizontalGroup(
@@ -144,12 +206,16 @@ public class FilesSetPanel extends javax.swing.JPanel {
             .addGroup(layout.createSequentialGroup()
                 .addContainerGap()
                 .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
+                    .addComponent(descPanel, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
                     .addGroup(javax.swing.GroupLayout.Alignment.TRAILING, layout.createSequentialGroup()
+                        .addGap(0, 0, Short.MAX_VALUE)
                         .addComponent(nameLabel, javax.swing.GroupLayout.PREFERRED_SIZE, 71, javax.swing.GroupLayout.PREFERRED_SIZE)
                         .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
                         .addComponent(nameTextField, javax.swing.GroupLayout.PREFERRED_SIZE, 299, javax.swing.GroupLayout.PREFERRED_SIZE))
-                    .addComponent(descPanel, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
-                    .addComponent(ignoreKnownFilesCheckbox, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE))
+                    .addGroup(javax.swing.GroupLayout.Alignment.TRAILING, layout.createSequentialGroup()
+                        .addComponent(ignoreKnownFilesCheckbox, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
+                        .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
+                        .addComponent(ignoreUnallocCheckbox, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)))
                 .addContainerGap())
         );
         layout.setVerticalGroup(
@@ -162,16 +228,20 @@ public class FilesSetPanel extends javax.swing.JPanel {
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
                 .addComponent(descPanel, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
-                .addComponent(ignoreKnownFilesCheckbox)
+                .addGroup(layout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
+                    .addComponent(ignoreKnownFilesCheckbox)
+                    .addComponent(ignoreUnallocCheckbox, javax.swing.GroupLayout.PREFERRED_SIZE, 23, javax.swing.GroupLayout.PREFERRED_SIZE))
                 .addContainerGap())
         );
     }// </editor-fold>//GEN-END:initComponents
+
 
     // Variables declaration - do not modify//GEN-BEGIN:variables
     private javax.swing.JPanel descPanel;
     private javax.swing.JScrollPane descScrollPanel;
     private javax.swing.JTextArea descTextArea;
     private javax.swing.JCheckBox ignoreKnownFilesCheckbox;
+    private javax.swing.JCheckBox ignoreUnallocCheckbox;
     private javax.swing.JLabel nameLabel;
     private javax.swing.JTextField nameTextField;
     // End of variables declaration//GEN-END:variables

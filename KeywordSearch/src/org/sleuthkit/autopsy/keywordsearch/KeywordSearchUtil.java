@@ -47,9 +47,7 @@ class KeywordSearchUtil {
             return query;
         }
 
-        StringBuilder sb = new StringBuilder();
-        sb.append("\"").append(query).append("\"");
-        return sb.toString();
+        return "\""+query+"\"";
     }
 
     /**
@@ -127,6 +125,26 @@ class KeywordSearchUtil {
         } else {
             return false;
         }
+    }
+    
+    static KeywordSearchQuery getQueryForKeyword(Keyword keyword, KeywordList keywordList) {
+        KeywordSearchQuery query = null;
+        if (keyword.searchTermIsLiteral()) {
+            // literal, exact match
+            if (keyword.searchTermIsWholeWord()) {
+                query = new LuceneQuery(keywordList, keyword);
+                query.escape();
+            } // literal, substring match
+            else {
+                query = new TermsComponentQuery(keywordList, keyword);
+                query.escape();
+                query.setSubstringQuery();
+            }
+        } // regexp
+        else {
+            query = new RegexQuery(keywordList, keyword);
+        }
+        return query;
     }
 
     /**

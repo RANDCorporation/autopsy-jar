@@ -29,7 +29,7 @@ import org.sleuthkit.autopsy.ingest.IngestModuleIngestJobSettings;
  * A factory for creating instances of file ingest modules that carve
  * unallocated space
  */
-@ServiceProvider(service = IngestModuleFactory.class)
+//@ServiceProvider(service = IngestModuleFactory.class)
 public class PhotoRecCarverIngestModuleFactory extends IngestModuleFactoryAdapter {
 
     private static final String VERSION = "7.0";

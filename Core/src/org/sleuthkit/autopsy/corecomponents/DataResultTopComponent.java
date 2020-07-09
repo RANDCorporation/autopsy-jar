@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2013 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,18 +21,19 @@ package org.sleuthkit.autopsy.corecomponents;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import org.sleuthkit.autopsy.corecomponentinterfaces.DataResult;
 import java.util.logging.Level;
 import javax.swing.JComponent;
 import org.openide.explorer.ExplorerManager;
 import org.openide.explorer.ExplorerUtils;
-import org.openide.util.NbBundle;
-import org.openide.windows.TopComponent;
 import org.openide.nodes.Node;
+import org.openide.util.NbBundle;
 import org.openide.windows.Mode;
+import org.openide.windows.RetainLocation;
+import org.openide.windows.TopComponent;
 import org.openide.windows.WindowManager;
 import org.sleuthkit.autopsy.actions.AddBookmarkTagAction;
 import org.sleuthkit.autopsy.casemodule.Case;
+import org.sleuthkit.autopsy.corecomponentinterfaces.DataResult;
 import org.sleuthkit.autopsy.corecomponentinterfaces.DataResultViewer;
 import org.sleuthkit.autopsy.coreutils.Logger;
 
@@ -55,11 +56,12 @@ import org.sleuthkit.autopsy.coreutils.Logger;
  * Implements DataResult interface by delegating to the encapsulated
  * DataResultPanel.
  */
+@RetainLocation("editor")
 public class DataResultTopComponent extends TopComponent implements DataResult, ExplorerManager.Provider {
 
     private static final Logger logger = Logger.getLogger(DataResultTopComponent.class.getName());
-    private ExplorerManager explorerManager = new ExplorerManager();
-    private DataResultPanel dataResultPanel; //embedded component with all the logic
+    private final ExplorerManager explorerManager = new ExplorerManager();
+    private final DataResultPanel dataResultPanel; //embedded component with all the logic
     private boolean isMain;
     private String customModeName;
 
@@ -75,7 +77,7 @@ public class DataResultTopComponent extends TopComponent implements DataResult, 
      */
     public DataResultTopComponent(boolean isMain, String title) {
         associateLookup(ExplorerUtils.createLookup(explorerManager, getActionMap()));
-        this.dataResultPanel = new DataResultPanel(isMain, title);
+        this.dataResultPanel = new DataResultPanel(title, isMain);
         initComponents();
         customizeComponent(isMain, title);
     }
@@ -86,7 +88,7 @@ public class DataResultTopComponent extends TopComponent implements DataResult, 
      *
      * @param name                unique name of the data result window, also
      *                            used as title
-     * @param customModeName      custom mode to dock into
+     * @param mode                custom mode to dock into
      * @param customContentViewer custom content viewer to send selection events
      *                            to
      */
@@ -255,16 +257,10 @@ public class DataResultTopComponent extends TopComponent implements DataResult, 
         if (customModeName != null) {
             Mode mode = WindowManager.getDefault().findMode(customModeName);
             if (mode != null) {
-                StringBuilder message = new StringBuilder("Found custom mode, setting: "); //NON-NLS
-                message.append(customModeName);
-                logger.log(Level.INFO, message.toString());
+                logger.log(Level.INFO, "Found custom mode, setting: {0}", customModeName);//NON-NLS
                 mode.dockInto(this);
-
             } else {
-                StringBuilder message = new StringBuilder("Could not find mode: "); //NON-NLS
-                message.append(customModeName);
-                message.append(", will dock into the default one"); //NON-NLS
-                logger.log(Level.WARNING, message.toString());
+                logger.log(Level.WARNING, "Could not find mode: {0}, will dock into the default one", customModeName);//NON-NLS
             }
         }
     }
@@ -314,7 +310,12 @@ public class DataResultTopComponent extends TopComponent implements DataResult, 
 
     @Override
     public boolean canClose() {
-        return (!this.isMain) || !Case.isCaseOpen() || Case.getCurrentCase().hasData() == false; // only allow this window to be closed when there's no case opened or no image in this case
+        /*
+         * If this is the results top component in the upper right of the main
+         * window, only allow it to be closed when there's no case opened or no
+         * data sources in the open case.
+         */
+        return (!this.isMain) || !Case.isCaseOpen() || Case.getCurrentCase().hasData() == false;
     }
 
     /**

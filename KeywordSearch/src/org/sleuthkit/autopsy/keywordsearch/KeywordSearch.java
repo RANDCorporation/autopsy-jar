@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,6 @@
  */
 package org.sleuthkit.autopsy.keywordsearch;
 
-import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeListener;
 import java.beans.PropertyChangeSupport;
 import java.io.IOException;
@@ -26,12 +25,11 @@ import java.util.logging.FileHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
+import org.openide.util.Exceptions;
 import org.openide.util.NbBundle;
 import org.sleuthkit.autopsy.casemodule.Case;
-import org.sleuthkit.autopsy.core.RuntimeProperties;
 import org.sleuthkit.autopsy.coreutils.MessageNotifyUtil;
 import org.sleuthkit.autopsy.coreutils.PlatformUtil;
-import org.sleuthkit.autopsy.keywordsearch.KeywordSearchResultFactory.BlackboardResultWriter;
 
 /**
  * Wrapper over KeywordSearch Solr server singleton. The class also provides
@@ -45,9 +43,10 @@ public class KeywordSearch {
     private static final Logger TIKA_LOGGER = Logger.getLogger("Tika"); //NON-NLS
     private static final org.sleuthkit.autopsy.coreutils.Logger logger = org.sleuthkit.autopsy.coreutils.Logger.getLogger(Case.class.getName());
 
+    // @@@ We should move this into TskData (or somewhere) because we are using
+    // this value in the results tree to display substring differently from regexp (KeywordHit.java)
     public enum QueryType {
-
-        LITERAL, REGEX
+        LITERAL, SUBSTRING, REGEX
     };
     public static final String NUM_FILES_CHANGE_EVT = "NUM_FILES_CHANGE_EVT"; //NON-NLS
     private static PropertyChangeSupport changeSupport = new PropertyChangeSupport(KeywordSearch.class);
@@ -58,6 +57,11 @@ public class KeywordSearch {
      *
      * @return singleton instance of KeywordSearch server
      */
+
+    public static synchronized Server createServer(String strSolrFolder, String strJavaPath) {
+        server = new Server(strSolrFolder, strJavaPath);
+        return server;
+    }
     public static synchronized Server getServer() {
         if (server == null) {
             server = new Server();
@@ -79,6 +83,19 @@ public class KeywordSearch {
             logger.log(Level.SEVERE, "Error setting up tika logging", ex); //NON-NLS
         }
     }
+
+
+    public static synchronized void openCore(String host, String port, String strModuleDirectory, String coreName) 
+    { 
+        try {
+            System.err.println("** Debug SOLR **" + String.format("%s %s %s %s\n", host, port, strModuleDirectory, coreName));
+            server.openCore(host, port, strModuleDirectory, coreName);
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "Could not open core. Exception: " + e); //NON-NLS
+            Exceptions.printStackTrace(e);
+        }
+    }
+
 
     // don't instantiate
     private KeywordSearch() {
@@ -107,56 +124,6 @@ public class KeywordSearch {
                     NbBundle.getMessage(KeywordSearch.class,
                             "KeywordSearch.fireNumIdxFileChg.moduleErr.msg"),
                     MessageNotifyUtil.MessageType.ERROR);
-        }
-    }
-
-    /**
-     * Listener to create/open and close Solr cores when cases are
-     * created/opened and closed.
-     */
-    static class CaseChangeListener implements PropertyChangeListener {
-
-        @Override
-        public void propertyChange(PropertyChangeEvent evt) {
-            if (evt.getPropertyName().equals(Case.Events.CURRENT_CASE.toString())) {
-                if (null != evt.getOldValue()) {
-                    /*
-                     * A case is being closed.
-                     */
-                    Case closedCase = (Case) evt.getOldValue();
-                    try {
-                        BlackboardResultWriter.stopAllWriters();
-                        /*
-                         * TODO (AUT-2084): The following code
-                         * KeywordSearch.CaseChangeListener gambles that any
-                         * BlackboardResultWriters (SwingWorkers) will complete
-                         * in less than roughly two seconds
-                         */
-                        Thread.sleep(2000);
-                        server.closeCore();
-                    } catch (Exception ex) {
-                        logger.log(Level.SEVERE, String.format("Failed to close core for %s", closedCase.getCaseDirectory()), ex); //NON-NLS
-                        if (RuntimeProperties.coreComponentsAreActive()) {
-                            MessageNotifyUtil.Notify.error(NbBundle.getMessage(KeywordSearch.class, "KeywordSearch.closeCore.notification.msg"), ex.getMessage());
-                        }
-                    }
-                }
-
-                if (null != evt.getNewValue()) {
-                    /*
-                     * A case is being created/opened.
-                     */
-                    Case openedCase = (Case) evt.getNewValue();
-                    try {
-                        server.openCoreForCase(openedCase);
-                    } catch (Exception ex) {
-                        logger.log(Level.SEVERE, String.format("Failed to open or create core for %s", openedCase.getCaseDirectory()), ex); //NON-NLS
-                        if (RuntimeProperties.coreComponentsAreActive()) {
-                            MessageNotifyUtil.Notify.error(NbBundle.getMessage(KeywordSearch.class, "KeywordSearch.openCore.notification.msg"), ex.getMessage());
-                        }
-                    }
-                }
-            }
         }
     }
 }

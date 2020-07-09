@@ -49,9 +49,10 @@ import org.sleuthkit.datamodel.TskCoreException;
 import org.sleuthkit.autopsy.core.ServicesMonitor;
 import org.sleuthkit.autopsy.modules.hashdatabase.HashDbManager.HashDb;
 import org.sleuthkit.autopsy.experimental.configuration.AutoIngestSettingsPanel.UpdateConfigSwingWorker;
-import org.sleuthkit.autopsy.experimental.coordinationservice.CoordinationService;
-import org.sleuthkit.autopsy.experimental.coordinationservice.CoordinationService.Lock;
-import org.sleuthkit.autopsy.experimental.coordinationservice.CoordinationService.CoordinationServiceException;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService.CategoryNode;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService.Lock;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService.CoordinationServiceException;
 
 /*
  * A utility class for loading and saving shared configuration data
@@ -78,6 +79,7 @@ public class SharedConfiguration {
     private static final String HASHDB_CONFIG_FILE_NAME = "hashLookup.settings"; //NON-NLS
     private static final String HASHDB_CONFIG_FILE_NAME_LEGACY = "hashsets.xml"; //NON-NLS
     public static final String FILE_EXPORTER_SETTINGS_FILE = "fileexporter.settings"; //NON-NLS
+    private static final String CENTRAL_REPOSITORY_PROPERTIES_FILE = "CentralRepository.properties"; //NON-NLS
     private static final String SHARED_CONFIG_VERSIONS = "SharedConfigVersions.txt"; //NON-NLS
 
     // Folders
@@ -86,13 +88,12 @@ public class SharedConfiguration {
     private static final String PREFERENCES_FOLDER = "Preferences"; //NON-NLS
     public static final String FILE_EXPORTER_FOLDER = "Automated File Exporter"; //NON-NLS
 
-    private static final String LOCK_ROOT = "/autopsy"; // NON-NLS
     private static final String UPLOAD_IN_PROGRESS_FILE = "uploadInProgress"; // NON-NLS
     private static final String moduleDirPath = PlatformUtil.getUserConfigDirectory();
     private static final Logger logger = Logger.getLogger(SharedConfiguration.class.getName());
 
     private final UpdateConfigSwingWorker swingWorker;
-    private AutoIngestUserPreferences.SelectedMode mode;
+    private UserPreferences.SelectedMode mode;
     private String sharedConfigFolder;
     private int fileIngestThreads;
     private boolean sharedConfigMaster;
@@ -160,7 +161,7 @@ public class SharedConfiguration {
 
         File remoteFolder = getSharedFolder();
 
-        try (Lock writeLock = CoordinationService.getInstance(LOCK_ROOT).tryGetExclusiveLock(CoordinationService.CategoryNode.CONFIG, remoteFolder.getAbsolutePath(), 30, TimeUnit.MINUTES)) {
+        try (Lock writeLock = CoordinationService.getInstance().tryGetExclusiveLock(CategoryNode.CONFIG, remoteFolder.getAbsolutePath(), 30, TimeUnit.MINUTES)) {
             if (writeLock == null) {
                 logger.log(Level.INFO, String.format("Failed to lock %s - another node is currently uploading or downloading configuration", remoteFolder.getAbsolutePath()));
                 return SharedConfigResult.LOCKED;
@@ -205,6 +206,7 @@ public class SharedConfiguration {
             uploadMultiUserAndGeneralSettings(remoteFolder);
             uploadHashDbSettings(remoteFolder);
             uploadFileExporterSettings(remoteFolder);
+            uploadCentralRepositorySettings(remoteFolder);
 
             try {
                 Files.deleteIfExists(uploadInProgress.toPath());
@@ -230,7 +232,7 @@ public class SharedConfiguration {
 
         File remoteFolder = getSharedFolder();
 
-        try (Lock readLock = CoordinationService.getInstance(LOCK_ROOT).tryGetSharedLock(CoordinationService.CategoryNode.CONFIG, remoteFolder.getAbsolutePath(), 30, TimeUnit.MINUTES)) {
+        try (Lock readLock = CoordinationService.getInstance().tryGetSharedLock(CategoryNode.CONFIG, remoteFolder.getAbsolutePath(), 30, TimeUnit.MINUTES)) {
             if (readLock == null) {
                 return SharedConfigResult.LOCKED;
             }
@@ -269,6 +271,7 @@ public class SharedConfiguration {
             downloadFileExtMismatchSettings(remoteFolder);
             downloadAndroidTriageSettings(remoteFolder);
             downloadFileExporterSettings(remoteFolder);
+            downloadCentralRepositorySettings(remoteFolder);
 
             // Download general settings, then restore the current
             // values for the unshared fields
@@ -775,6 +778,30 @@ public class SharedConfiguration {
     }
 
     /**
+     * Upload central repository settings.
+     *
+     * @param remoteFolder Shared settings folder
+     *
+     * @throws SharedConfigurationException
+     */
+    private void uploadCentralRepositorySettings(File remoteFolder) throws SharedConfigurationException {
+        publishTask("Uploading central repository configuration");
+        copyToRemoteFolder(CENTRAL_REPOSITORY_PROPERTIES_FILE, moduleDirPath, remoteFolder, true);
+    }
+
+    /**
+     * Download central repository settings.
+     *
+     * @param remoteFolder Shared settings folder
+     *
+     * @throws SharedConfigurationException
+     */
+    private void downloadCentralRepositorySettings(File remoteFolder) throws SharedConfigurationException {
+        publishTask("Downloading central repository configuration");
+        copyToLocalFolder(CENTRAL_REPOSITORY_PROPERTIES_FILE, moduleDirPath, remoteFolder, true);
+    }
+
+    /**
      * Upload multi-user settings and other general Autopsy settings
      *
      * @param remoteFolder Shared settings folder
@@ -1095,7 +1122,7 @@ public class SharedConfiguration {
         try {
             HashDbManager hashDbManager = HashDbManager.getInstance();
             hashDbManager.loadLastSavedConfiguration();
-            for (HashDb hashDb : hashDbManager.getAllHashSets()) {
+            for (HashDbManager.HashDb hashDb : hashDbManager.getAllHashSets()) {
                 if (hashDb.hasIndexOnly()) {
                     results.add(hashDb.getIndexPath());
                 } else {

@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,31 +53,60 @@ public final class CaseMetadata {
 
     private static final String FILE_EXTENSION = ".aut";
     private static final DateFormat DATE_FORMAT = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss (z)");
+
+    /*
+     * Fields from schema version 1
+     */
     private static final String SCHEMA_VERSION_ONE = "1.0";
-    private final static String AUTOPSY_CREATED_VERSION_ELEMENT_NAME = "AutopsyCreatedVersion"; //NON-NLS
-    private final static String CASE_DATABASE_NAME_ELEMENT_NAME = "DatabaseName"; //NON-NLS
-    private final static String TEXT_INDEX_NAME_ELEMENT = "TextIndexName"; //NON-NLS
-    private static final String CURRENT_SCHEMA_VERSION = "2.0";
     private final static String ROOT_ELEMENT_NAME = "AutopsyCase"; //NON-NLS
     private final static String SCHEMA_VERSION_ELEMENT_NAME = "SchemaVersion"; //NON-NLS
     private final static String CREATED_DATE_ELEMENT_NAME = "CreatedDate"; //NON-NLS
-    private final static String MODIFIED_DATE_ELEMENT_NAME = "ModifiedDate"; //NON-NLS
-    private final static String AUTOPSY_CREATED_BY_ELEMENT_NAME = "CreatedByAutopsyVersion"; //NON-NLS
-    private final static String AUTOPSY_SAVED_BY_ELEMENT_NAME = "SavedByAutopsyVersion"; //NON-NLS
+    private final static String AUTOPSY_VERSION_ELEMENT_NAME = "AutopsyCreatedVersion"; //NON-NLS
     private final static String CASE_ELEMENT_NAME = "Case"; //NON-NLS
     private final static String CASE_NAME_ELEMENT_NAME = "Name"; //NON-NLS
     private final static String CASE_NUMBER_ELEMENT_NAME = "Number"; //NON-NLS
     private final static String EXAMINER_ELEMENT_NAME = "Examiner"; //NON-NLS
     private final static String CASE_TYPE_ELEMENT_NAME = "CaseType"; //NON-NLS
-    private final static String CASE_DATABASE_ELEMENT_NAME = "Database"; //NON-NLS
+    private final static String CASE_DATABASE_NAME_ELEMENT_NAME = "DatabaseName"; //NON-NLS
+    private final static String TEXT_INDEX_NAME_ELEMENT = "TextIndexName"; //NON-NLS
+
+    /*
+     * Fields from schema version 2
+     */
+    private static final String SCHEMA_VERSION_TWO = "2.0";
+    private final static String AUTOPSY_CREATED_BY_ELEMENT_NAME = "CreatedByAutopsyVersion"; //NON-NLS
+    private final static String CASE_DB_ABSOLUTE_PATH_ELEMENT_NAME = "Database"; //NON-NLS
     private final static String TEXT_INDEX_ELEMENT = "TextIndex"; //NON-NLS
+
+    /*
+     * Fields from schema version 3
+     */
+    private static final String SCHEMA_VERSION_THREE = "3.0";
+    private final static String CASE_DISPLAY_NAME_ELEMENT_NAME = "DisplayName"; //NON-NLS
+    private final static String CASE_DB_NAME_RELATIVE_ELEMENT_NAME = "CaseDatabase"; //NON-NLS
+
+    /*
+     * Fields from schema version 4
+     */
+    private static final String SCHEMA_VERSION_FOUR = "4.0";
+    private final static String EXAMINER_ELEMENT_PHONE = "ExaminerPhone"; //NON-NLS  
+    private final static String EXAMINER_ELEMENT_EMAIL = "ExaminerEmail"; //NON-NLS
+    private final static String CASE_ELEMENT_NOTES = "CaseNotes"; //NON-NLS
+    /*
+     * Unread fields, regenerated on save.
+     */
+    private final static String MODIFIED_DATE_ELEMENT_NAME = "ModifiedDate"; //NON-NLS
+    private final static String AUTOPSY_SAVED_BY_ELEMENT_NAME = "SavedByAutopsyVersion"; //NON-NLS
+
+    private final static String CURRENT_SCHEMA_VERSION = SCHEMA_VERSION_FOUR;
+
     private final Path metadataFilePath;
     private Case.CaseType caseType;
     private String caseName;
-    private String caseNumber;
-    private String examiner;
-    private String caseDatabase;
-    private String textIndexName;
+    private CaseDetails caseDetails;
+    private String caseDatabaseName;
+    private String caseDatabasePath; // Legacy
+    private String textIndexName; // Legacy
     private String createdDate;
     private String createdByVersion;
 
@@ -91,38 +120,33 @@ public final class CaseMetadata {
     }
 
     /**
-     * Constructs an object that provides access to the case metadata stored in
-     * a new case metadata file that is created using the supplied metadata.
+     * Constructs a CaseMetadata object for a new case. The metadata is not
+     * persisted to the case metadata file until writeFile or a setX method is
+     * called.
      *
-     * @param caseDirectory     The case directory.
-     * @param caseType          The type of case.
-     * @param caseName          The name of the case.
-     * @param caseNumber        The case number.
-     * @param examiner          The name of the case examiner.
-     * @param caseDatabase      For a single-user case, the full path to the
-     *                          case database file. For a multi-user case, the
-     *                          case database name.
-     * @param caseTextIndexName The text index name.
-     *
-     * @throws CaseMetadataException If the new case metadata file cannot be
-     *                               created.
+     * @param caseDirectory   The case directory.
+     * @param caseType        The type of case.
+     * @param caseName        The immutable name of the case.
+     * @param caseDisplayName The display name of the case, can be changed by a
+     *                        user.
+     * @param caseNumber      The case number.
+     * @param examiner        The name of the case examiner.
      */
-    CaseMetadata(String caseDirectory, Case.CaseType caseType, String caseName, String caseNumber, String examiner, String caseDatabase, String caseTextIndexName) throws CaseMetadataException {
-        metadataFilePath = Paths.get(caseDirectory, caseName + FILE_EXTENSION);
+    CaseMetadata(Case.CaseType caseType, String caseDirectory, String caseName, CaseDetails caseDetails) {
+        metadataFilePath = Paths.get(caseDirectory, caseDetails.getCaseDisplayName() + FILE_EXTENSION);
         this.caseType = caseType;
         this.caseName = caseName;
-        this.caseNumber = caseNumber;
-        this.examiner = examiner;
-        this.caseDatabase = caseDatabase;
-        this.textIndexName = caseTextIndexName;
+        this.caseDetails = caseDetails;
+        caseDatabaseName = "";
+        caseDatabasePath = "";
+        textIndexName = "";
         createdByVersion = Version.getVersion();
         createdDate = CaseMetadata.DATE_FORMAT.format(new Date());
-        writeToFile();
     }
 
     /**
-     * Constructs an object that provides access to the case metadata stored in
-     * an existing case metadata file.
+     * Constructs a CaseMetadata object for an existing case. The metadata is
+     * read from an existing case metadata file.
      *
      * @param metadataFilePath The full path to the case metadata file.
      *
@@ -162,7 +186,7 @@ public final class CaseMetadata {
     }
 
     /**
-     * Gets the case display name.
+     * Gets the unique and immutable case name.
      *
      * @return The case display name.
      */
@@ -171,18 +195,30 @@ public final class CaseMetadata {
     }
 
     /**
-     * Sets the case display name. This does not change the name of the case
-     * directory, the case database, or the text index name.
+     * Get current values for the case details which are user modifiable.
      *
-     * @param caseName A case display name.
+     * @return the case details
      */
-    void setCaseName(String caseName) throws CaseMetadataException {
-        String oldCaseName = caseName;
-        this.caseName = caseName;
+    public CaseDetails getCaseDetails() {
+        return caseDetails;
+    }
+
+    /**
+     * Gets the case display name.
+     *
+     * @return The case display name.
+     */
+    public String getCaseDisplayName() {
+        return caseDetails.getCaseDisplayName();
+    }
+
+    void setCaseDetails(CaseDetails newCaseDetails) throws CaseMetadataException {
+        CaseDetails oldCaseDetails = this.caseDetails;
+        this.caseDetails = newCaseDetails;
         try {
             writeToFile();
         } catch (CaseMetadataException ex) {
-            this.caseName = oldCaseName;
+            this.caseDetails = oldCaseDetails;
             throw ex;
         }
     }
@@ -193,7 +229,7 @@ public final class CaseMetadata {
      * @return The case number, may be empty.
      */
     public String getCaseNumber() {
-        return caseNumber;
+        return caseDetails.getCaseNumber();
     }
 
     /**
@@ -202,42 +238,53 @@ public final class CaseMetadata {
      * @return The examiner, may be empty.
      */
     public String getExaminer() {
-        return examiner;
+        return caseDetails.getExaminerName();
+    }
+
+    public String getExaminerPhone() {
+        return caseDetails.getExaminerPhone();
+    }
+
+    public String getExaminerEmail() {
+        return caseDetails.getExaminerEmail();
+    }
+
+    public String getCaseNotes() {
+        return caseDetails.getCaseNotes();
     }
 
     /**
-     * Gets the name of the case case database.
+     * Gets the name of the case database.
      *
-     * @return The case database name.
+     * @return The case database name, may be empty.
      */
     public String getCaseDatabaseName() {
-        if (caseType == Case.CaseType.MULTI_USER_CASE) {
-            return caseDatabase;
-        } else {
-            return Paths.get(caseDatabase).getFileName().toString();
-        }
+        return caseDatabaseName;
     }
 
     /**
-     * Gets the full path to the case database file if the case is a single-user
-     * case.
+     * Sets the name of the case database.
      *
-     * @return The full path to the case database file for a single-user case.
+     * @param caseDatabaseName The case database name.
      *
-     * @throws UnsupportedOperationException If called for a multi-user case.
+     * @throws CaseMetadataException If the operation fails.
      */
-    public String getCaseDatabasePath() throws UnsupportedOperationException {
-        if (caseType == Case.CaseType.SINGLE_USER_CASE) {
-            return caseDatabase;
-        } else {
-            throw new UnsupportedOperationException();
+    void setCaseDatabaseName(String caseDatabaseName) throws CaseMetadataException {
+        String oldCaseDatabaseName = this.caseDatabaseName;
+        this.caseDatabaseName = caseDatabaseName;
+        try {
+            writeToFile();
+        } catch (CaseMetadataException ex) {
+            this.caseDatabaseName = oldCaseDatabaseName;
+            throw ex;
         }
     }
 
     /**
-     * Gets the text index name.
+     * Gets the text index name. This is a legacy field and will be empty for
+     * cases created with Autopsy 4.4.0 and above.
      *
-     * @return The name of the text index for the case.
+     * @return The name of the text index for the case, may be empty.
      */
     public String getTextIndexName() {
         return textIndexName;
@@ -246,7 +293,7 @@ public final class CaseMetadata {
     /**
      * Gets the date the case was created.
      *
-     * @return The date this case was created as a string
+     * @return The date this case was created, as a string.
      */
     String getCreatedDate() {
         return createdDate;
@@ -256,7 +303,9 @@ public final class CaseMetadata {
      * Sets the date the case was created. Used for preserving the case creation
      * date during single-user to multi-user case conversion.
      *
-     * @param createdDate The date the case was created as a string.
+     * @param createdDate The date the case was created, as a string.
+     *
+     * @throws CaseMetadataException If the operation fails.
      */
     void setCreatedDate(String createdDate) throws CaseMetadataException {
         String oldCreatedDate = createdDate;
@@ -282,13 +331,15 @@ public final class CaseMetadata {
      * Sets the Autopsy version that created the case. Used for preserving this
      * metadata during single-user to multi-user case conversion.
      *
-     * @param buildVersion An build version identifier.
+     * @param buildVersion A build version identifier.
+     *
+     * @throws CaseMetadataException If the operation fails.
      */
     void setCreatedByVersion(String buildVersion) throws CaseMetadataException {
         String oldCreatedByVersion = this.createdByVersion;
         this.createdByVersion = buildVersion;
         try {
-            this.writeToFile();
+            writeToFile();
         } catch (CaseMetadataException ex) {
             this.createdByVersion = oldCreatedByVersion;
             throw ex;
@@ -355,10 +406,15 @@ public final class CaseMetadata {
          * Create the children of the case element.
          */
         createChildElement(doc, caseElement, CASE_NAME_ELEMENT_NAME, caseName);
-        createChildElement(doc, caseElement, CASE_NUMBER_ELEMENT_NAME, caseNumber);
-        createChildElement(doc, caseElement, EXAMINER_ELEMENT_NAME, examiner);
+        createChildElement(doc, caseElement, CASE_DISPLAY_NAME_ELEMENT_NAME, caseDetails.getCaseDisplayName());
+        createChildElement(doc, caseElement, CASE_NUMBER_ELEMENT_NAME, caseDetails.getCaseNumber());
+        createChildElement(doc, caseElement, EXAMINER_ELEMENT_NAME, caseDetails.getExaminerName());
+        createChildElement(doc, caseElement, EXAMINER_ELEMENT_PHONE, caseDetails.getExaminerPhone());
+        createChildElement(doc, caseElement, EXAMINER_ELEMENT_EMAIL, caseDetails.getExaminerEmail());
+        createChildElement(doc, caseElement, CASE_ELEMENT_NOTES, caseDetails.getCaseNotes());
         createChildElement(doc, caseElement, CASE_TYPE_ELEMENT_NAME, caseType.toString());
-        createChildElement(doc, caseElement, CASE_DATABASE_ELEMENT_NAME, caseDatabase);
+        createChildElement(doc, caseElement, CASE_DB_ABSOLUTE_PATH_ELEMENT_NAME, caseDatabasePath);
+        createChildElement(doc, caseElement, CASE_DB_NAME_RELATIVE_ELEMENT_NAME, caseDatabaseName);
         createChildElement(doc, caseElement, TEXT_INDEX_ELEMENT, textIndexName);
     }
 
@@ -402,7 +458,7 @@ public final class CaseMetadata {
             String schemaVersion = getElementTextContent(rootElement, SCHEMA_VERSION_ELEMENT_NAME, true);
             this.createdDate = getElementTextContent(rootElement, CREATED_DATE_ELEMENT_NAME, true);
             if (schemaVersion.equals(SCHEMA_VERSION_ONE)) {
-                this.createdByVersion = getElementTextContent(rootElement, AUTOPSY_CREATED_VERSION_ELEMENT_NAME, true);
+                this.createdByVersion = getElementTextContent(rootElement, AUTOPSY_VERSION_ELEMENT_NAME, true);
             } else {
                 this.createdByVersion = getElementTextContent(rootElement, AUTOPSY_CREATED_BY_ELEMENT_NAME, true);
             }
@@ -416,25 +472,60 @@ public final class CaseMetadata {
             }
             Element caseElement = (Element) caseElements.item(0);
             this.caseName = getElementTextContent(caseElement, CASE_NAME_ELEMENT_NAME, true);
-            this.caseNumber = getElementTextContent(caseElement, CASE_NUMBER_ELEMENT_NAME, false);
-            this.examiner = getElementTextContent(caseElement, EXAMINER_ELEMENT_NAME, false);
+            String caseDisplayName;
+            String caseNumber;
+            if (schemaVersion.equals(SCHEMA_VERSION_ONE) || schemaVersion.equals(SCHEMA_VERSION_TWO)) {
+                caseDisplayName = caseName;
+            } else {
+                caseDisplayName = getElementTextContent(caseElement, CASE_DISPLAY_NAME_ELEMENT_NAME, true);
+            }
+            caseNumber = getElementTextContent(caseElement, CASE_NUMBER_ELEMENT_NAME, false);
+            String examinerName = getElementTextContent(caseElement, EXAMINER_ELEMENT_NAME, false);
+            String examinerPhone;
+            String examinerEmail;
+            String caseNotes;
+            if (schemaVersion.equals(SCHEMA_VERSION_ONE) || schemaVersion.equals(SCHEMA_VERSION_TWO) || schemaVersion.equals(SCHEMA_VERSION_THREE)) {
+                examinerPhone = "";  //case had metadata file written before additional examiner details were included 
+                examinerEmail = "";
+                caseNotes = "";
+            } else {
+                examinerPhone = getElementTextContent(caseElement, EXAMINER_ELEMENT_PHONE, false);
+                examinerEmail = getElementTextContent(caseElement, EXAMINER_ELEMENT_EMAIL, false);
+                caseNotes = getElementTextContent(caseElement, CASE_ELEMENT_NOTES, false);
+            }
+            this.caseDetails = new CaseDetails(caseDisplayName, caseNumber, examinerName, examinerPhone, examinerEmail, caseNotes);
             this.caseType = Case.CaseType.fromString(getElementTextContent(caseElement, CASE_TYPE_ELEMENT_NAME, true));
             if (null == this.caseType) {
                 throw new CaseMetadataException("Case metadata file corrupted");
             }
-            if (schemaVersion.equals(SCHEMA_VERSION_ONE)) {
-                this.caseDatabase = getElementTextContent(caseElement, CASE_DATABASE_NAME_ELEMENT_NAME, true);
-                this.textIndexName = getElementTextContent(caseElement, TEXT_INDEX_NAME_ELEMENT, true);
-            } else {
-                this.caseDatabase = getElementTextContent(caseElement, CASE_DATABASE_ELEMENT_NAME, true);
-                this.textIndexName = getElementTextContent(caseElement, TEXT_INDEX_ELEMENT, true);
+            switch (schemaVersion) {
+                case SCHEMA_VERSION_ONE:
+                    this.caseDatabaseName = getElementTextContent(caseElement, CASE_DATABASE_NAME_ELEMENT_NAME, true);
+                    this.textIndexName = getElementTextContent(caseElement, TEXT_INDEX_NAME_ELEMENT, true);
+                    break;
+                case SCHEMA_VERSION_TWO:
+                    this.caseDatabaseName = getElementTextContent(caseElement, CASE_DB_ABSOLUTE_PATH_ELEMENT_NAME, true);
+                    this.textIndexName = getElementTextContent(caseElement, TEXT_INDEX_ELEMENT, false);
+                    break;
+                default:
+                    this.caseDatabaseName = getElementTextContent(caseElement, CASE_DB_NAME_RELATIVE_ELEMENT_NAME, true);
+                    this.textIndexName = getElementTextContent(caseElement, TEXT_INDEX_ELEMENT, false);
+                    break;
             }
 
             /*
-             * Update the file to the current schema, if necessary.
+             * Fix up the case database name due to a bug that for a time caused
+             * the absolute paths of single-user case databases to be stored.
+             * Derive the missing (absolute/relative) value from the one
+             * present.
              */
-            if (!schemaVersion.equals(CURRENT_SCHEMA_VERSION)) {
-                writeToFile();
+            Path possibleAbsoluteCaseDbPath = Paths.get(this.caseDatabaseName);
+            Path caseDirectoryPath = Paths.get(getCaseDirectory());
+            if (possibleAbsoluteCaseDbPath.getNameCount() > 1) {
+                this.caseDatabasePath = this.caseDatabaseName;
+                this.caseDatabaseName = caseDirectoryPath.relativize(possibleAbsoluteCaseDbPath).toString();
+            } else {
+                this.caseDatabasePath = caseDirectoryPath.resolve(caseDatabaseName).toAbsolutePath().toString();
             }
 
         } catch (ParserConfigurationException | SAXException | IOException ex) {
@@ -449,7 +540,7 @@ public final class CaseMetadata {
      * @param elementName       The element name.
      * @param contentIsRequired Whether or not the content is required.
      *
-     * @return The text content, may be empty if not required.
+     * @return The text content, may be empty If not required.
      *
      * @throws CaseMetadataException If the element is missing or content is
      *                               required and it is empty.
@@ -480,6 +571,24 @@ public final class CaseMetadata {
 
         private CaseMetadataException(String message, Throwable cause) {
             super(message, cause);
+        }
+    }
+
+    /**
+     * Gets the full path to the case database file if the case is a single-user
+     * case.
+     *
+     * @return The full path to the case database file for a single-user case.
+     *
+     * @throws UnsupportedOperationException If called for a multi-user case.
+     * @deprecated Do not use.
+     */
+    @Deprecated
+    public String getCaseDatabasePath() throws UnsupportedOperationException {
+        if (Case.CaseType.SINGLE_USER_CASE == caseType) {
+            return Paths.get(getCaseDirectory(), caseDatabaseName).toString();
+        } else {
+            throw new UnsupportedOperationException();
         }
     }
 

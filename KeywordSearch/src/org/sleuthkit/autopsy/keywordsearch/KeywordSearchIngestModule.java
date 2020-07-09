@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2015 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import org.openide.util.NbBundle;
+import org.openide.util.NbBundle.Messages;
 import org.sleuthkit.autopsy.casemodule.Case;
 import org.sleuthkit.autopsy.core.UserPreferences;
 import org.sleuthkit.autopsy.coreutils.Logger;
@@ -89,7 +90,7 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
     //accessed read-only by searcher thread
 
     private boolean startedSearching = false;
-    private List<TextExtractor> textExtractors;
+    private List<FileTextExtractor> textExtractors;
     private StringsTextExtractor stringExtractor;
     private final KeywordSearchJobSettings settings;
     private boolean initialized = false;
@@ -114,6 +115,7 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
     /**
      * Records the ingest status for a given file for a given ingest job. Used
      * for final statistics at the end of the job.
+     *
      * @param ingestJobId id of ingest job
      * @param fileId      id of file
      * @param status      ingest status of the file
@@ -140,6 +142,11 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
      * retrieves settings, keyword lists to run on
      *
      */
+    @Messages({
+        "KeywordSearchIngestModule.startupMessage.failedToGetIndexSchema=Failed to get schema version for text index.",
+        "# {0} - Solr version number", "KeywordSearchIngestModule.startupException.indexSolrVersionNotSupported=Adding text no longer supported for Solr version {0} of the text index.",
+        "# {0} - schema version number", "KeywordSearchIngestModule.startupException.indexSchemaNotSupported=Adding text no longer supported for schema version {0} of the text index."
+    })
     @Override
     public void startUp(IngestJobContext context) throws IngestModuleException {
         initialized = false;
@@ -152,11 +159,24 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
         }
 
         try {
+            Index indexInfo = server.getIndexInfo();
+            if (!IndexFinder.getCurrentSolrVersion().equals(indexInfo.getSolrVersion())) {
+                throw new IngestModuleException(Bundle.KeywordSearchIngestModule_startupException_indexSolrVersionNotSupported(indexInfo.getSolrVersion()));
+            }
+            if (!IndexFinder.getCurrentSchemaVersion().equals(indexInfo.getSchemaVersion())) {
+                throw new IngestModuleException(Bundle.KeywordSearchIngestModule_startupException_indexSchemaNotSupported(indexInfo.getSchemaVersion()));
+            }
+        } catch (NoOpenCoreException ex) {
+            throw new IngestModuleException(Bundle.KeywordSearchIngestModule_startupMessage_failedToGetIndexSchema(), ex);
+        }
+
+        try {
             fileTypeDetector = new FileTypeDetector();
         } catch (FileTypeDetector.FileTypeDetectorInitException ex) {
             throw new IngestModuleException(Bundle.CannotRunFileTypeDetection(), ex);
         }
-        ingester = Server.getIngester();
+
+        ingester = Ingester.getDefault();
         this.context = context;
 
         // increment the module reference count
@@ -229,7 +249,7 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
     public ProcessResult process(AbstractFile abstractFile) {
         if (initialized == false) //error initializing indexing/Solr
         {
-            logger.log(Level.WARNING, "Skipping processing, module not initialized, file: {0}", abstractFile.getName());  //NON-NLS
+            logger.log(Level.SEVERE, "Skipping processing, module not initialized, file: {0}", abstractFile.getName());  //NON-NLS
             putIngestStatus(jobId, abstractFile.getId(), IngestStatus.SKIPPED_ERROR_INDEXING);
             return ProcessResult.OK;
         }
@@ -273,14 +293,16 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
      */
     @Override
     public void shutDown() {
-        logger.log(Level.INFO, "Instance {0}", instanceNum); //NON-NLS
+        logger.log(Level.INFO, "Keyword search ingest module instance {0} shutting down", instanceNum); //NON-NLS
 
         if ((initialized == false) || (context == null)) {
             return;
         }
 
         if (context.fileIngestIsCancelled()) {
-            stop();
+            logger.log(Level.INFO, "Keyword search ingest module instance {0} stopping search job due to ingest cancellation", instanceNum); //NON-NLS
+            SearchRunner.getInstance().stopJob(jobId);
+            cleanup();
             return;
         }
 
@@ -289,33 +311,19 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
 
         // We only need to post the summary msg from the last module per job
         if (refCounter.decrementAndGet(jobId) == 0) {
+            try {
+                final int numIndexedFiles = KeywordSearch.getServer().queryNumIndexedFiles();
+                logger.log(Level.INFO, "Indexed files count: {0}", numIndexedFiles); //NON-NLS
+                final int numIndexedChunks = KeywordSearch.getServer().queryNumIndexedChunks();
+                logger.log(Level.INFO, "Indexed file chunks count: {0}", numIndexedChunks); //NON-NLS
+            } catch (NoOpenCoreException | KeywordSearchModuleException ex) {
+                logger.log(Level.SEVERE, "Error executing Solr queries to check number of indexed files and file chunks", ex); //NON-NLS
+            }
             postIndexSummary();
             synchronized (ingestStatus) {
                 ingestStatus.remove(jobId);
             }
         }
-
-        //log number of files / chunks in index
-        //signal a potential change in number of text_ingested files
-        try {
-            final int numIndexedFiles = KeywordSearch.getServer().queryNumIndexedFiles();
-            final int numIndexedChunks = KeywordSearch.getServer().queryNumIndexedChunks();
-            logger.log(Level.INFO, "Indexed files count: {0}", numIndexedFiles); //NON-NLS
-            logger.log(Level.INFO, "Indexed file chunks count: {0}", numIndexedChunks); //NON-NLS
-        } catch (NoOpenCoreException | KeywordSearchModuleException ex) {
-            logger.log(Level.WARNING, "Error executing Solr query to check number of indexed files/chunks: ", ex); //NON-NLS
-        }
-
-        cleanup();
-    }
-
-    /**
-     * Handle stop event (ingest interrupted) Cleanup resources, threads, timers
-     */
-    private void stop() {
-        logger.log(Level.INFO, "stop()"); //NON-NLS
-
-        SearchRunner.getInstance().stopJob(jobId);
 
         cleanup();
     }
@@ -415,24 +423,24 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
          * @throws IngesterException exception thrown if indexing failed
          */
         private boolean extractTextAndIndex(AbstractFile aFile, String detectedFormat) throws IngesterException {
-            TextExtractor fileExtract = null;
+            FileTextExtractor extractor = null;
 
             //go over available text extractors in order, and pick the first one (most specific one)
-            for (TextExtractor fe : textExtractors) {
+            for (FileTextExtractor fe : textExtractors) {
                 if (fe.isSupported(aFile, detectedFormat)) {
-                    fileExtract = fe;
+                    extractor = fe;
                     break;
                 }
             }
 
-            if (fileExtract == null) {
-                logger.log(Level.INFO, "No text extractor found for file id:{0}, name: {1}, detected format: {2}", new Object[]{aFile.getId(), aFile.getName(), detectedFormat}); //NON-NLS
+            if (extractor == null) {
+                // No text extractor found.
                 return false;
             }
 
             //logger.log(Level.INFO, "Extractor: " + fileExtract + ", file: " + aFile.getName());
             //divide into chunks and index
-            return fileExtract.index(aFile, context);
+            return Ingester.getDefault().indexText(extractor, aFile, context);
         }
 
         /**
@@ -448,7 +456,7 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
                 if (context.fileIngestIsCancelled()) {
                     return true;
                 }
-                if (stringExtractor.index(aFile, KeywordSearchIngestModule.this.context)) {
+                if (Ingester.getDefault().indexText(stringExtractor, aFile, KeywordSearchIngestModule.this.context)) {
                     putIngestStatus(jobId, aFile.getId(), IngestStatus.STRINGS_INGESTED);
                     return true;
                 } else {
@@ -461,26 +469,6 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
                 putIngestStatus(jobId, aFile.getId(), IngestStatus.SKIPPED_ERROR_INDEXING);
                 return false;
             }
-        }
-
-        /**
-         * Check with every extractor if it supports the file with the detected
-         * format
-         *
-         * @param aFile          file to check for
-         * @param detectedFormat mime-type with detected format (such as
-         *                       text/plain) or null if not detected
-         *
-         * @return true if text extraction is supported
-         */
-        private boolean isTextExtractSupported(AbstractFile aFile, String detectedFormat) {
-            for (TextExtractor extractor : textExtractors) {
-                if (extractor.isContentTypeSpecific() == true
-                        && extractor.isSupported(aFile, detectedFormat)) {
-                    return true;
-                }
-            }
-            return false;
         }
 
         /**
@@ -512,7 +500,7 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
                     if (context.fileIngestIsCancelled()) {
                         return;
                     }
-                    ingester.ingest(aFile, false); //meta-data only
+                    ingester.indexMetaDataOnly(aFile);
                     putIngestStatus(jobId, aFile.getId(), IngestStatus.METADATA_INGESTED);
                 } catch (IngesterException ex) {
                     putIngestStatus(jobId, aFile.getId(), IngestStatus.SKIPPED_ERROR_INDEXING);
@@ -534,12 +522,12 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
 
             // we skip archive formats that are opened by the archive module. 
             // @@@ We could have a check here to see if the archive module was enabled though...
-            if (TextExtractor.ARCHIVE_MIME_TYPES.contains(fileType)) {
+            if (FileTextExtractor.ARCHIVE_MIME_TYPES.contains(fileType)) {
                 try {
                     if (context.fileIngestIsCancelled()) {
                         return;
                     }
-                    ingester.ingest(aFile, false); //meta-data only
+                    ingester.indexMetaDataOnly(aFile);
                     putIngestStatus(jobId, aFile.getId(), IngestStatus.METADATA_INGESTED);
                 } catch (IngesterException ex) {
                     putIngestStatus(jobId, aFile.getId(), IngestStatus.SKIPPED_ERROR_INDEXING);
@@ -561,7 +549,7 @@ public final class KeywordSearchIngestModule implements FileIngestModule {
                     return;
                 }
                 if (!extractTextAndIndex(aFile, fileType)) {
-                    logger.log(Level.WARNING, "Text extractor not found for file. Extracting strings only. File: ''{0}'' (id:{1}).", new Object[]{aFile.getName(), aFile.getId()}); //NON-NLS
+                    // Text extractor not found for file. Extract string only.
                     putIngestStatus(jobId, aFile.getId(), IngestStatus.SKIPPED_ERROR_TEXTEXTRACT);
                 } else {
                     putIngestStatus(jobId, aFile.getId(), IngestStatus.TEXT_INGESTED);

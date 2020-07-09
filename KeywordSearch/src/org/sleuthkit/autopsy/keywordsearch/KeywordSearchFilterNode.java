@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2013 Basis Technology Corp.
+ * Copyright 2013-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,33 +19,44 @@
 package org.sleuthkit.autopsy.keywordsearch;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import javax.swing.Action;
 import org.openide.nodes.FilterNode;
 import org.openide.nodes.Node;
 import org.openide.nodes.Node.Property;
-import org.openide.nodes.PropertySupport;
 import org.openide.nodes.Sheet;
 import org.openide.util.NbBundle;
+import org.openide.util.Utilities;
 import org.openide.util.lookup.Lookups;
 import org.openide.util.lookup.ProxyLookup;
 import org.sleuthkit.autopsy.coreutils.ContextMenuExtensionPoint;
 import org.sleuthkit.autopsy.directorytree.ExternalViewerAction;
 import org.sleuthkit.autopsy.directorytree.ExtractAction;
 import org.sleuthkit.autopsy.actions.AddContentTagAction;
+import org.sleuthkit.autopsy.actions.DeleteFileContentTagAction;
 import org.sleuthkit.autopsy.directorytree.HashSearchAction;
 import org.sleuthkit.autopsy.directorytree.NewWindowViewAction;
+import org.sleuthkit.datamodel.AbstractFile;
 import org.sleuthkit.datamodel.Content;
 import org.sleuthkit.datamodel.ContentVisitor;
 import org.sleuthkit.datamodel.DerivedFile;
+import org.sleuthkit.datamodel.Directory;
 import org.sleuthkit.datamodel.File;
+import org.sleuthkit.datamodel.LayoutFile;
+import org.sleuthkit.datamodel.LocalFile;
+import org.sleuthkit.datamodel.SlackFile;
+import org.sleuthkit.datamodel.TskData;
+import org.sleuthkit.datamodel.VirtualDirectory;
 
 /**
  *
  */
 class KeywordSearchFilterNode extends FilterNode {
 
-    KeywordSearchFilterNode(HighlightedText highlights, Node original) {
+    KeywordSearchFilterNode(QueryResults highlights, Node original) {
         super(original, null, new ProxyLookup(Lookups.singleton(highlights), original.getLookup()));
     }
 
@@ -88,7 +99,7 @@ class KeywordSearchFilterNode extends FilterNode {
     public Action[] getActions(boolean popup) {
 
         List<Action> actions = new ArrayList<>();
-
+        actions.addAll(Arrays.asList(super.getActions(popup)));
         Content content = this.getOriginal().getLookup().lookup(Content.class);
         actions.addAll(content.accept(new GetPopupActionsContentVisitor()));
 
@@ -99,30 +110,66 @@ class KeywordSearchFilterNode extends FilterNode {
 
         @Override
         public List<Action> visit(File f) {
-            return getFileActions();
+            return getFileActions(true);
         }
 
         @Override
         public List<Action> visit(DerivedFile f) {
-            return getFileActions();
+            return getFileActions(true);
         }
 
-        private List<Action> getFileActions() {
-            List<Action> actions = new ArrayList<>();
-            actions.add(new NewWindowViewAction(NbBundle.getMessage(this.getClass(), "KeywordSearchFilterNode.getFileActions.viewInNewWinActionLbl"), KeywordSearchFilterNode.this));
-            actions.add(new ExternalViewerAction(NbBundle.getMessage(this.getClass(), "KeywordSearchFilterNode.getFileActions.openExternViewActLbl"), getOriginal()));
-            actions.add(null);
-            actions.add(ExtractAction.getInstance());
-            actions.add(new HashSearchAction(NbBundle.getMessage(this.getClass(), "KeywordSearchFilterNode.getFileActions.searchSameMd5"), getOriginal()));
-            actions.add(null); // creates a menu separator
-            actions.add(AddContentTagAction.getInstance());
-            actions.addAll(ContextMenuExtensionPoint.getActions());
-            return actions;
+        @Override
+        public List<Action> visit(Directory d) {
+            return getFileActions(false);
+        }
+
+        @Override
+        public List<Action> visit(LayoutFile lf) {
+            //we want hashsearch enabled on carved files but not unallocated blocks
+            boolean enableHashSearch = (lf.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.CARVED);
+            return getFileActions(enableHashSearch);
+        }
+
+        @Override
+        public List<Action> visit(LocalFile lf) {
+            return getFileActions(true);
+        }
+
+        @Override
+        public List<Action> visit(SlackFile f) {
+            return getFileActions(false);
+        }
+
+        @Override
+        public List<Action> visit(VirtualDirectory dir) {
+            return getFileActions(false);
+        }
+
+        private List<Action> getFileActions(boolean enableHashSearch) {
+            List<Action> actionsList = new ArrayList<>();
+            actionsList.add(new NewWindowViewAction(NbBundle.getMessage(this.getClass(), "KeywordSearchFilterNode.getFileActions.viewInNewWinActionLbl"), KeywordSearchFilterNode.this));
+            actionsList.add(new ExternalViewerAction(NbBundle.getMessage(this.getClass(), "KeywordSearchFilterNode.getFileActions.openExternViewActLbl"), getOriginal()));
+            actionsList.add(null);
+            actionsList.add(ExtractAction.getInstance());
+            Action hashSearchAction = new HashSearchAction(NbBundle.getMessage(this.getClass(), "KeywordSearchFilterNode.getFileActions.searchSameMd5"), getOriginal());
+            hashSearchAction.setEnabled(enableHashSearch);
+            actionsList.add(hashSearchAction);
+            actionsList.add(null); // creates a menu separator
+            actionsList.add(AddContentTagAction.getInstance());
+
+            final Collection<AbstractFile> selectedFilesList
+                    = new HashSet<>(Utilities.actionsGlobalContext().lookupAll(AbstractFile.class));
+            if (selectedFilesList.size() == 1) {
+                actionsList.add(DeleteFileContentTagAction.getInstance());
+            }
+
+            actionsList.addAll(ContextMenuExtensionPoint.getActions());
+            return actionsList;
         }
 
         @Override
         protected List<Action> defaultVisit(Content c) {
-            return new ArrayList<>();
+            return getFileActions(false);
         }
     }
 }

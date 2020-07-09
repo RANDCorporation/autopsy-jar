@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2015 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,83 +18,76 @@
  */
 package org.sleuthkit.autopsy.keywordsearch;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Comparator;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 import org.sleuthkit.autopsy.casemodule.Case;
-import org.sleuthkit.datamodel.BlackboardArtifact;
-import org.sleuthkit.datamodel.Content;
 import org.sleuthkit.datamodel.SleuthkitCase;
 import org.sleuthkit.datamodel.TskCoreException;
 
 /**
- * Stores the fact that file or an artifact associated with a file had a keyword
- * hit. All instances make both the document id of the Solr document where the
- * keyword was found and the file available to clients. Artifact keyword hits
- * also make the artifact available to clients.
+ * Represents the fact that a file or an artifact associated with a file had a
+ * keyword hit. All instances make both the document id of the Solr document
+ * where the keyword was found and the object id of the file available to
+ * clients. Keyword hits on the indexed text of an artifact also make the
+ * artifact available to clients.
  */
-class KeywordHit {
+class KeywordHit implements Comparable<KeywordHit> {
 
-    private final String solrDocumentId;
+    private static final String GET_CONTENT_ID_FROM_ARTIFACT_ID = "SELECT obj_id FROM blackboard_artifacts WHERE artifact_id = ";
+
     private final long solrObjectId;
     private final int chunkId;
     private final String snippet;
-    private final Content content;
-    private final BlackboardArtifact artifact;
+    private final String hit;
 
-    KeywordHit(String solrDocumentId, String snippet) throws TskCoreException {
-        /**
-         * Store the Solr document id.
-         */
-        this.solrDocumentId = solrDocumentId;
+    /**
+     * Constructor
+     *
+     * @param solrDocumentId The id of the document this hit is in.
+     * @param snippet        A small amount of text from the document containing
+     *                       the hit.
+     * @param hit            The exact text from the document that was the hit.
+     *                       For some searches (ie substring, regex) this will be
+     *                       different than the search term.
+     *
+     */
+    KeywordHit(String solrDocumentId, String snippet, String hit) {
+        this.snippet = StringUtils.stripToEmpty(snippet);
+        this.hit = hit;
 
-        /**
+        /*
          * Parse the Solr document id to get the Solr object id and chunk id.
-         * The Solr object id will either be a file id or an artifact id from
-         * the case database.
+         * The Solr object id will either be the object id of a file id or an
+         * artifact id from the case database.
          *
          * For every object (file or artifact) there will at least two Solr
          * documents. One contains object metadata (chunk #1) and the second and
          * subsequent documents contain chunks of the text.
          */
-        final int separatorIndex = solrDocumentId.indexOf(Server.CHUNK_ID_SEPARATOR);
-        if (-1 != separatorIndex) {
-            this.solrObjectId = Long.parseLong(solrDocumentId.substring(0, separatorIndex));
-            this.chunkId = Integer.parseInt(solrDocumentId.substring(separatorIndex + 1));
-        } else {
+        String[] split = solrDocumentId.split(Server.CHUNK_ID_SEPARATOR);
+        if (split.length == 1) {
+            //chunk 0 has only the bare document id without the chunk id.
             this.solrObjectId = Long.parseLong(solrDocumentId);
             this.chunkId = 0;
-        }
-
-        /**
-         * Look up the file associated with the keyword hit. If the high order
-         * bit of the object id is set, the hit was for an artifact. In this
-         * case, look up the artifact as well.
-         */
-        SleuthkitCase caseDb = Case.getCurrentCase().getSleuthkitCase();
-        long fileId;
-        if (this.solrObjectId < 0) {
-            this.artifact = caseDb.getBlackboardArtifact(this.solrObjectId);
-            fileId = artifact.getObjectID();
         } else {
-            this.artifact = null;
-            fileId = this.solrObjectId;
+            this.solrObjectId = Long.parseLong(split[0]);
+            this.chunkId = Integer.parseInt(split[1]);
         }
-        this.content = caseDb.getContentById(fileId);
+    }
 
-        /**
-         * Store the text snippet.
-         */
-        this.snippet = snippet;
+    String getHit() {
+        return hit;
     }
 
     String getSolrDocumentId() {
-        return this.solrDocumentId;
+        return Long.toString(solrObjectId) + Server.CHUNK_ID_SEPARATOR + Long.toString(chunkId);
     }
 
     long getSolrObjectId() {
         return this.solrObjectId;
-    }
-
-    boolean hasChunkId() {
-        return this.chunkId != 0;
     }
 
     int getChunkId() {
@@ -102,23 +95,66 @@ class KeywordHit {
     }
 
     boolean hasSnippet() {
-        return !this.snippet.isEmpty();
+        return StringUtils.isNotBlank(this.snippet);
     }
 
     String getSnippet() {
         return this.snippet;
     }
 
-    Content getContent() {
-        return this.content;
+    /**
+     * Get the content id associated with the content underlying hit. 
+     * For hits on files this will be the same as the object id associated 
+     * with the file. For hits on artifacts we look up the id of the object
+     * that produced the artifact.
+     * 
+     * @return The id of the underlying content associated with the hit.
+     * @throws TskCoreException If there is a problem getting the underlying
+     *                          content associated with a hit on the text of an
+     *                          artifact.
+     */
+    long getContentID() throws TskCoreException {
+        if (isArtifactHit()) {
+            // If the hit was in an artifact, look up the source content for the artifact.
+            SleuthkitCase caseDb = Case.getCurrentCase().getSleuthkitCase();
+            try (SleuthkitCase.CaseDbQuery executeQuery =
+                    caseDb.executeQuery(GET_CONTENT_ID_FROM_ARTIFACT_ID + this.solrObjectId);
+                    ResultSet resultSet = executeQuery.getResultSet();) {
+                if (resultSet.next()) {
+                    return resultSet.getLong("obj_id");
+                } else {
+                    throw new TskCoreException("Failed to get obj_id for artifact with artifact_id =" + this.solrObjectId + ".  No matching artifact was found.");
+                }
+            } catch (SQLException ex) {
+                throw new TskCoreException("Error getting obj_id for artifact with artifact_id =" + this.solrObjectId, ex);
+            }
+        } else {
+            //else the object id is for content.
+            return this.solrObjectId;
+        }
     }
 
+    /**
+     * Is this hit in the indexed text of an artifact.
+     *
+     * @return
+     */
     boolean isArtifactHit() {
-        return (null != this.artifact);
+        // artifacts have negative obj ids
+        return this.solrObjectId < 0;
     }
 
-    BlackboardArtifact getArtifact() {
-        return this.artifact;
+    /**
+     * If this hit is in the indexed text of an artifact, get that artifact.
+     *
+     * @return The artifact whose indexed text this hit is in.
+     */
+    Optional<Long> getArtifactID() {
+        if (isArtifactHit()) {
+            return Optional.of(solrObjectId);
+        } else {
+            return Optional.empty();
+        }
     }
 
     @Override
@@ -130,7 +166,7 @@ class KeywordHit {
             return false;
         }
         final KeywordHit other = (KeywordHit) obj;
-        return (this.solrObjectId == other.solrObjectId && this.chunkId == other.chunkId);
+        return this.compareTo(other) == 0;
     }
 
     @Override
@@ -140,4 +176,10 @@ class KeywordHit {
         return hash;
     }
 
+    @Override
+    public int compareTo(KeywordHit o) {
+        return Comparator.comparing(KeywordHit::getSolrObjectId)
+                .thenComparing(KeywordHit::getChunkId)
+                .compare(this, o);
+    }
 }

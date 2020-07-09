@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,12 +25,16 @@ import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JFormattedTextField;
 import javax.swing.JMenuItem;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 
 /**
  *
  * @author pmartel
  */
 class SizeSearchPanel extends javax.swing.JPanel {
+
+    private static final long serialVersionUID = 1L;
 
     /**
      * Creates new form SizeSearchPanel
@@ -63,6 +67,24 @@ class SizeSearchPanel extends javax.swing.JPanel {
         copyMenuItem.addActionListener(actList);
         pasteMenuItem.addActionListener(actList);
         selectAllMenuItem.addActionListener(actList);
+            this.sizeTextField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                firePropertyChange(FileSearchPanel.EVENT.CHECKED.toString(), null, null);
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                firePropertyChange(FileSearchPanel.EVENT.CHECKED.toString(), null, null);
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                firePropertyChange(FileSearchPanel.EVENT.CHECKED.toString(), null, null);
+            }
+        });
+
+
 
     }
 
@@ -123,11 +145,6 @@ class SizeSearchPanel extends javax.swing.JPanel {
         sizeUnitComboBox.setModel(new javax.swing.DefaultComboBoxModel<String>(new String[] { "Byte(s)", "KB", "MB", "GB", "TB" }));
 
         sizeTextField.setValue(0);
-        sizeTextField.addMouseListener(new java.awt.event.MouseAdapter() {
-            public void mouseClicked(java.awt.event.MouseEvent evt) {
-                sizeTextFieldMouseClicked(evt);
-            }
-        });
 
         sizeCompareComboBox.setModel(new javax.swing.DefaultComboBoxModel<String>(new String[] { "equal to", "greater than", "less than" }));
 
@@ -160,11 +177,6 @@ class SizeSearchPanel extends javax.swing.JPanel {
                 .addComponent(sizeCheckBox))
         );
     }// </editor-fold>//GEN-END:initComponents
-
-    private void sizeTextFieldMouseClicked(java.awt.event.MouseEvent evt) {//GEN-FIRST:event_sizeTextFieldMouseClicked
-        this.sizeCheckBox.setSelected(true);
-        this.sizeTextField.selectAll(); // select all so user can change it easily
-    }//GEN-LAST:event_sizeTextFieldMouseClicked
 
     private void sizeCheckBoxActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_sizeCheckBoxActionPerformed
         setComponentsEnabled();

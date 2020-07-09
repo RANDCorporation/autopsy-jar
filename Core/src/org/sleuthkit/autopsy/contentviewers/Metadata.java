@@ -59,18 +59,24 @@ public class Metadata extends javax.swing.JPanel implements DataContentViewer {
         jScrollPane2 = new javax.swing.JScrollPane();
         jTextPane1 = new javax.swing.JTextPane();
 
+        setPreferredSize(new java.awt.Dimension(610, 52));
+
+        jScrollPane2.setHorizontalScrollBarPolicy(javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        jScrollPane2.setPreferredSize(new java.awt.Dimension(610, 52));
+
         jTextPane1.setEditable(false);
+        jTextPane1.setPreferredSize(new java.awt.Dimension(600, 52));
         jScrollPane2.setViewportView(jTextPane1);
 
         javax.swing.GroupLayout layout = new javax.swing.GroupLayout(this);
         this.setLayout(layout);
         layout.setHorizontalGroup(
             layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
-            .addComponent(jScrollPane2, javax.swing.GroupLayout.DEFAULT_SIZE, 400, Short.MAX_VALUE)
+            .addComponent(jScrollPane2, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
         );
         layout.setVerticalGroup(
             layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
-            .addComponent(jScrollPane2, javax.swing.GroupLayout.DEFAULT_SIZE, 300, Short.MAX_VALUE)
+            .addComponent(jScrollPane2, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
         );
     }// </editor-fold>//GEN-END:initComponents
     // Variables declaration - do not modify//GEN-BEGIN:variables
@@ -113,7 +119,9 @@ public class Metadata extends javax.swing.JPanel implements DataContentViewer {
         sb.append("</td></tr>"); //NON-NLS
     }
 
-    @Messages({"Metadata.tableRowTitle.mimeType=MIME Type"})
+    @Messages({
+        "Metadata.tableRowTitle.mimeType=MIME Type",
+        "Metadata.nodeText.truncated=(results truncated)"})
     @Override
     public void setNode(Node node) {
         AbstractFile file = node.getLookup().lookup(AbstractFile.class);
@@ -169,6 +177,15 @@ public class Metadata extends javax.swing.JPanel implements DataContentViewer {
                 sb.append(" <br /><br />"); // NON-NLS
                 for (String str : fsFile.getMetaDataText()) {
                     sb.append(str).append("<br />"); //NON-NLS
+                    
+                    /* 
+                     * Very long results can cause the UI to hang before displaying,
+                     * so truncate the results if necessary.
+                     */
+                    if(sb.length() > 50000){
+                        sb.append(NbBundle.getMessage(this.getClass(), "Metadata.nodeText.truncated"));
+                        break;
+                    }
                 }
                 sb.append("</pre>\n"); //NON-NLS
             }
@@ -203,6 +220,7 @@ public class Metadata extends javax.swing.JPanel implements DataContentViewer {
 
     @Override
     public void resetComponent() {
+        setText("");
         return;
     }
 

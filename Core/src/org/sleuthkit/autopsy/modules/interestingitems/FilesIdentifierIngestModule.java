@@ -19,6 +19,7 @@
 package org.sleuthkit.autopsy.modules.interestingitems;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +33,7 @@ import org.sleuthkit.autopsy.coreutils.Logger;
 import org.sleuthkit.autopsy.coreutils.MessageNotifyUtil;
 import org.sleuthkit.autopsy.ingest.FileIngestModule;
 import org.sleuthkit.autopsy.ingest.IngestJobContext;
+import org.sleuthkit.autopsy.ingest.IngestMessage;
 import org.sleuthkit.autopsy.ingest.IngestModuleReferenceCounter;
 import org.sleuthkit.autopsy.ingest.IngestServices;
 import org.sleuthkit.autopsy.ingest.ModuleDataEvent;
@@ -55,6 +57,7 @@ final class FilesIdentifierIngestModule implements FileIngestModule {
     private static final IngestModuleReferenceCounter refCounter = new IngestModuleReferenceCounter();
     private static final Map<Long, List<FilesSet>> interestingFileSetsByJob = new ConcurrentHashMap<>();
     private final FilesIdentifierIngestJobSettings settings;
+    private final IngestServices services = IngestServices.getInstance();
     private IngestJobContext context;
     private Blackboard blackboard;
 
@@ -83,12 +86,12 @@ final class FilesIdentifierIngestModule implements FileIngestModule {
                 // to disable the interesting files set definition UI during ingest.
                 List<FilesSet> filesSets = new ArrayList<>();
                 try {
-                    for (FilesSet set : InterestingItemDefsManager.getInstance().getInterestingFilesSets().values()) {
+                    for (FilesSet set : FilesSetsManager.getInstance().getInterestingFilesSets().values()) {
                         if (settings.interestingFilesSetIsEnabled(set.getName())) {
                             filesSets.add(set);
                         }
                     }
-                } catch (InterestingItemDefsManager.InterestingItemDefsManagerException ex) {
+                } catch (FilesSetsManager.FilesSetsManagerException ex) {
                     throw new IngestModuleException(Bundle.FilesIdentifierIngestModule_getFilesError(), ex);
                 }
                 FilesIdentifierIngestModule.interestingFileSetsByJob.put(context.getJobId(), filesSets);
@@ -103,7 +106,7 @@ final class FilesIdentifierIngestModule implements FileIngestModule {
     @Messages({"FilesIdentifierIngestModule.indexError.message=Failed to index interesting file hit artifact for keyword search."})
     public ProcessResult process(AbstractFile file) {
         blackboard = Case.getCurrentCase().getServices().getBlackboard();
-        
+
         // Skip slack space files.
         if (file.getType().equals(TskData.TSK_DB_FILES_TYPE_ENUM.SLACK)) {
             return ProcessResult.OK;
@@ -119,6 +122,7 @@ final class FilesIdentifierIngestModule implements FileIngestModule {
                     // blackboard.
                     String moduleName = InterestingItemsIngestModuleFactory.getModuleName();
                     BlackboardArtifact artifact = file.newArtifact(BlackboardArtifact.ARTIFACT_TYPE.TSK_INTERESTING_FILE_HIT);
+                    Collection<BlackboardAttribute> attributes = new ArrayList<>();
 
                     // Add a set name attribute to the artifact. This adds a 
                     // fair amount of redundant data to the attributes table 
@@ -126,13 +130,14 @@ final class FilesIdentifierIngestModule implements FileIngestModule {
                     // otherwise would requires reworking the interesting files
                     // set hit artifact.
                     BlackboardAttribute setNameAttribute = new BlackboardAttribute(BlackboardAttribute.ATTRIBUTE_TYPE.TSK_SET_NAME, moduleName, filesSet.getName());
-                    artifact.addAttribute(setNameAttribute);
+                    attributes.add(setNameAttribute);
 
                     // Add a category attribute to the artifact to record the 
                     // interesting files set membership rule that was satisfied.
                     BlackboardAttribute ruleNameAttribute = new BlackboardAttribute(BlackboardAttribute.ATTRIBUTE_TYPE.TSK_CATEGORY, moduleName, ruleSatisfied);
-                    artifact.addAttribute(ruleNameAttribute);
+                    attributes.add(ruleNameAttribute);
 
+                    artifact.addAttributes(attributes);
                     try {
                         // index the artifact for keyword search
                         blackboard.indexArtifact(artifact);
@@ -141,7 +146,18 @@ final class FilesIdentifierIngestModule implements FileIngestModule {
                         MessageNotifyUtil.Notify.error(Bundle.FilesIdentifierIngestModule_indexError_message(), artifact.getDisplayName());
                     }
 
-                    IngestServices.getInstance().fireModuleDataEvent(new ModuleDataEvent(moduleName, BlackboardArtifact.ARTIFACT_TYPE.TSK_INTERESTING_FILE_HIT, Collections.singletonList(artifact)));
+                    services.fireModuleDataEvent(new ModuleDataEvent(moduleName, BlackboardArtifact.ARTIFACT_TYPE.TSK_INTERESTING_FILE_HIT, Collections.singletonList(artifact)));
+
+                    // make an ingest inbox message
+                    StringBuilder detailsSb = new StringBuilder();
+                    detailsSb.append("File: " + file.getParentPath() + file.getName() + "<br/>\n");
+                    detailsSb.append("Rule Set: " + filesSet.getName());
+
+                    services.postMessage(IngestMessage.createDataMessage(InterestingItemsIngestModuleFactory.getModuleName(),
+                            "Interesting File Match: " + filesSet.getName() + "(" + file.getName() +")",
+                            detailsSb.toString(),
+                            file.getName(),
+                            artifact));
 
                 } catch (TskCoreException ex) {
                     FilesIdentifierIngestModule.logger.log(Level.SEVERE, "Error posting to the blackboard", ex); //NOI18N NON-NLS

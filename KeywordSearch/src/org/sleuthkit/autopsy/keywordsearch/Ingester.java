@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,49 +18,42 @@
  */
 package org.sleuthkit.autopsy.keywordsearch;
 
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.Reader;
-import java.io.UnsupportedEncodingException;
+import java.io.BufferedReader;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.logging.Level;
 import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.common.util.ContentStream;
 import org.apache.solr.common.SolrInputDocument;
 import org.openide.util.NbBundle;
 import org.sleuthkit.autopsy.coreutils.Logger;
-import org.sleuthkit.autopsy.coreutils.TextUtil;
 import org.sleuthkit.autopsy.datamodel.ContentUtils;
-import org.sleuthkit.datamodel.AbstractContent;
+import org.sleuthkit.autopsy.ingest.IngestJobContext;
+import org.sleuthkit.autopsy.keywordsearch.Chunker.Chunk;
 import org.sleuthkit.datamodel.AbstractFile;
-import org.sleuthkit.datamodel.Content;
-import org.sleuthkit.datamodel.ContentVisitor;
+import org.sleuthkit.datamodel.BlackboardArtifact;
 import org.sleuthkit.datamodel.DerivedFile;
 import org.sleuthkit.datamodel.Directory;
 import org.sleuthkit.datamodel.File;
 import org.sleuthkit.datamodel.LayoutFile;
+import org.sleuthkit.datamodel.LocalDirectory;
 import org.sleuthkit.datamodel.LocalFile;
-import org.sleuthkit.datamodel.ReadContentInputStream;
 import org.sleuthkit.datamodel.SlackFile;
+import org.sleuthkit.datamodel.SleuthkitItemVisitor;
+import org.sleuthkit.datamodel.SleuthkitVisitableItem;
 import org.sleuthkit.datamodel.TskCoreException;
 
 /**
  * Handles indexing files on a Solr core.
  */
+//JMTODO: Should this class really be a singleton?
 class Ingester {
 
     private static final Logger logger = Logger.getLogger(Ingester.class.getName());
     private volatile boolean uncommitedIngests = false;
     private final Server solrServer = KeywordSearch.getServer();
-    private final GetContentFieldsV getContentFieldsV = new GetContentFieldsV();
+    private static final SolrFieldsVisitor SOLR_FIELDS_VISITOR = new SolrFieldsVisitor();
     private static Ingester instance;
-
-    //for ingesting chunk as SolrInputDocument (non-content-streaming, by-pass tika)
-    //TODO use a streaming way to add content to /update handler
-    private static final int MAX_DOC_CHUNK_SIZE = 1024 * 1024;
-    private static final String ENCODING = "UTF-8"; //NON-NLS
+    private static final int SINGLE_READ_CHARS = 512;
 
     private Ingester() {
     }
@@ -72,6 +65,7 @@ class Ingester {
         return instance;
     }
 
+    //JMTODO: this is probably useless
     @Override
     @SuppressWarnings("FinalizeDeclaration")
     protected void finalize() throws Throwable {
@@ -84,287 +78,169 @@ class Ingester {
     }
 
     /**
-     * Sends a stream to Solr to have its content extracted and added to the
-     * index. commit() should be called once you're done ingesting files.
+     * Sends the metadata (name, MAC times, image id, etc) for the given file to
+     * Solr to be added to the index. commit() should be called once you're done
+     * indexing.
      *
-     * @param afscs File AbstractFileStringContentStream to ingest
-     *
-     * @throws IngesterException if there was an error processing a specific
-     *                           file, but the Solr server is probably fine.
-     */
-    void ingest(AbstractFileStringContentStream afscs) throws IngesterException {
-        Map<String, String> params = getContentFields(afscs.getSourceContent());
-        ingest(afscs, params, afscs.getSourceContent().getSize());
-    }
-
-    /**
-     * Sends a TextExtractor to Solr to have its content extracted and added to
-     * the index. commit() should be called once you're done ingesting files.
-     * FileExtract represents a parent of extracted file with actual content.
-     * The parent itself has no content, only meta data and is used to associate
-     * the extracted AbstractFileChunk
-     *
-     * @param fe TextExtractor to ingest
+     * @param file File to index.
      *
      * @throws IngesterException if there was an error processing a specific
      *                           file, but the Solr server is probably fine.
      */
-    void ingest(TextExtractor fe) throws IngesterException {
-        Map<String, String> params = getContentFields(fe.getSourceFile());
-
-        params.put(Server.Schema.NUM_CHUNKS.toString(), Integer.toString(fe.getNumChunks()));
-
-        ingest(new NullContentStream(fe.getSourceFile()), params, 0);
+    void indexMetaDataOnly(AbstractFile file) throws IngesterException {
+        indexChunk("", file.getName(), getContentFields(file));
     }
 
     /**
-     * Sends a AbstractFileChunk to Solr and its extracted content stream to be
-     * added to the index. commit() should be called once you're done ingesting
-     * files. AbstractFileChunk represents a file chunk and its chunk content.
+     * Sends the metadata (artifact id, image id, etc) for the given artifact to
+     * Solr to be added to the index. commit() should be called once you're done
+     * indexing.
      *
-     * @param fec  AbstractFileChunk to ingest
-     * @param size approx. size of the stream in bytes, used for timeout
-     *             estimation
+     * @param artifact The artifact to index.
      *
      * @throws IngesterException if there was an error processing a specific
-     *                           file, but the Solr server is probably fine.
+     *                           artifact, but the Solr server is probably fine.
      */
-    void ingest(AbstractFileChunk fec, ByteContentStream bcs, int size) throws IngesterException {
-        AbstractContent sourceContent = bcs.getSourceContent();
-        Map<String, String> params = getContentFields(sourceContent);
-
-        //overwrite id with the chunk id
-        params.put(Server.Schema.ID.toString(),
-                Server.getChunkIdString(sourceContent.getId(), fec.getChunkNumber()));
-
-        ingest(bcs, params, size);
+    void indexMetaDataOnly(BlackboardArtifact artifact) throws IngesterException {
+        indexChunk("", new ArtifactTextExtractor().getName(artifact), getContentFields(artifact));
     }
 
     /**
-     * Sends a file to Solr to have its content extracted and added to the
-     * index. commit() should be called once you're done ingesting files. If the
-     * file is a directory or ingestContent is set to false, the file name is
-     * indexed only.
+     * Creates a field map from a SleuthkitVisitableItem, that is later sent to
+     * Solr.
      *
-     * @param file          File to ingest
-     * @param ingestContent if true, index the file and the content, otherwise
-     *                      indesx metadata only
+     * @param item SleuthkitVisitableItem to get fields from
      *
-     * @throws IngesterException if there was an error processing a specific
-     *                           file, but the Solr server is probably fine.
+     * @return the map from field name to value (as a string)
      */
-    void ingest(AbstractFile file, boolean ingestContent) throws IngesterException {
-        if (ingestContent == false || file.isDir()) {
-            ingest(new NullContentStream(file), getContentFields(file), 0);
-        } else {
-            ingest(new FscContentStream(file), getContentFields(file), file.getSize());
-        }
+    private Map<String, String> getContentFields(SleuthkitVisitableItem item) {
+        return item.accept(SOLR_FIELDS_VISITOR);
     }
 
     /**
-     * Creates a field map from FsContent, that is later sent to Solr
+     * Use the given TextExtractor to extract text from the given source. The
+     * text will be chunked and each chunk passed to Solr to add to the index.
      *
-     * @param fsc FsContent to get fields from
      *
-     * @return the map
+     * @param <A>       The type of the Appendix provider that provides
+     *                  additional text to append to the final chunk.
+     * @param <T>       A subclass of SleuthkitVisibleItem.
+     * @param extractor The TextExtractor that will be used to extract text from
+     *                  the given source.
+     * @param source    The source from which text will be extracted, chunked,
+     *                  and indexed.
+     * @param context   The ingest job context that can be used to cancel this
+     *                  process.
+     *
+     * @return True if indexing was completed, false otherwise.
+     *
+     * @throws org.sleuthkit.autopsy.keywordsearch.Ingester.IngesterException
      */
-    private Map<String, String> getContentFields(AbstractContent fsc) {
-        return fsc.accept(getContentFieldsV);
-    }
+    // TODO (JIRA-3118): Cancelled text indexing does not propagate cancellation to clients 
+    < T extends SleuthkitVisitableItem> boolean indexText(TextExtractor< T> extractor, T source, IngestJobContext context) throws Ingester.IngesterException {
+        final long sourceID = extractor.getID(source);
+        final String sourceName = extractor.getName(source);
 
-    /**
-     * Visitor used to create param list to send to SOLR index.
-     */
-    private class GetContentFieldsV extends ContentVisitor.Default<Map<String, String>> {
+        int numChunks = 0; //unknown until chunking is done
 
-        @Override
-        protected Map<String, String> defaultVisit(Content cntnt) {
-            return new HashMap<>();
+        if (extractor.isDisabled()) {
+            /*
+             * some Extractors, notable the strings extractor, have options
+             * which can be configured such that no extraction should be done
+             */
+            return true;
         }
 
-        @Override
-        public Map<String, String> visit(File f) {
-            Map<String, String> params = getCommonFields(f);
-            getCommonFileContentFields(params, f);
-            return params;
-        }
+        Map<String, String> fields = getContentFields(source);
+        //Get a reader for the content of the given source
+        try (BufferedReader reader = new BufferedReader(extractor.getReader(source));) {
+            Chunker chunker = new Chunker(reader);
+            for (Chunk chunk : chunker) {
+                if (context != null && context.fileIngestIsCancelled()) {
+                    logger.log(Level.INFO, "File ingest cancelled. Cancelling keyword search indexing of {0}", sourceName);
+                    return false;
+                }
+                String chunkId = Server.getChunkIdString(sourceID, numChunks + 1);
+                fields.put(Server.Schema.ID.toString(), chunkId);
+                fields.put(Server.Schema.CHUNK_SIZE.toString(), String.valueOf(chunk.getBaseChunkLength()));
+                try {
+                    //add the chunk text to Solr index
+                    indexChunk(chunk.toString(), sourceName, fields);
+                    numChunks++;
+                } catch (Ingester.IngesterException ingEx) {
+                    extractor.logWarning("Ingester had a problem with extracted string from file '" //NON-NLS
+                            + sourceName + "' (id: " + sourceID + ").", ingEx);//NON-NLS
 
-        @Override
-        public Map<String, String> visit(DerivedFile df) {
-            Map<String, String> params = getCommonFields(df);
-            getCommonFileContentFields(params, df);
-            return params;
-        }
-
-        @Override
-        public Map<String, String> visit(Directory d) {
-            Map<String, String> params = getCommonFields(d);
-            getCommonFileContentFields(params, d);
-            return params;
-        }
-
-        @Override
-        public Map<String, String> visit(LayoutFile lf) {
-            // layout files do not have times
-            return getCommonFields(lf);
-        }
-
-        @Override
-        public Map<String, String> visit(LocalFile lf) {
-            Map<String, String> params = getCommonFields(lf);
-            getCommonFileContentFields(params, lf);
-            return params;
-        }
-
-        @Override
-        public Map<String, String> visit(SlackFile f) {
-            Map<String, String> params = getCommonFields(f);
-            getCommonFileContentFields(params, f);
-            return params;
-        }
-
-        private Map<String, String> getCommonFileContentFields(Map<String, String> params, AbstractFile file) {
-            params.put(Server.Schema.CTIME.toString(), ContentUtils.getStringTimeISO8601(file.getCtime(), file));
-            params.put(Server.Schema.ATIME.toString(), ContentUtils.getStringTimeISO8601(file.getAtime(), file));
-            params.put(Server.Schema.MTIME.toString(), ContentUtils.getStringTimeISO8601(file.getMtime(), file));
-            params.put(Server.Schema.CRTIME.toString(), ContentUtils.getStringTimeISO8601(file.getCrtime(), file));
-            return params;
-        }
-
-        private Map<String, String> getCommonFields(AbstractFile af) {
-            Map<String, String> params = new HashMap<>();
-            params.put(Server.Schema.ID.toString(), Long.toString(af.getId()));
-            try {
-                long dataSourceId = af.getDataSource().getId();
-                params.put(Server.Schema.IMAGE_ID.toString(), Long.toString(dataSourceId));
-            } catch (TskCoreException ex) {
-                logger.log(Level.SEVERE, "Could not get data source id to properly index the file {0}", af.getId()); //NON-NLS
-                params.put(Server.Schema.IMAGE_ID.toString(), Long.toString(-1));
+                    throw ingEx; //need to rethrow to signal error and move on
+                }
             }
-
-            params.put(Server.Schema.FILE_NAME.toString(), af.getName());
-            return params;
+            if (chunker.hasException()) {
+                extractor.logWarning("Error chunking content from " + sourceID + ": " + sourceName, chunker.getException());
+                return false;
+            }
+        } catch (Exception ex) {
+            extractor.logWarning("Unexpected error, can't read content stream from " + sourceID + ": " + sourceName, ex);//NON-NLS
+            return false;
+        } finally {
+            if (context != null && context.fileIngestIsCancelled()) {
+                return false;
+            } else {
+                //after all chunks, index just the meta data, including the  numChunks, of the parent file
+                fields.put(Server.Schema.NUM_CHUNKS.toString(), Integer.toString(numChunks));
+                //reset id field to base document id
+                fields.put(Server.Schema.ID.toString(), Long.toString(sourceID));
+                //"parent" docs don't have chunk_size
+                fields.remove(Server.Schema.CHUNK_SIZE.toString());
+                indexChunk(null, sourceName, fields);
+            }
         }
+        return true;
     }
 
     /**
-     * Indexing method that bypasses Tika, assumes pure text It reads and
-     * converts the entire content stream to string, assuming UTF8 since we
-     * can't use streaming approach for Solr /update handler. This should be
-     * safe, since all content is now in max 1MB chunks.
+     * Add one chunk as to the Solr index as a separate Solr document.
      *
      * TODO see if can use a byte or string streaming way to add content to
      * /update handler e.g. with XMLUpdateRequestHandler (deprecated in SOlr
      * 4.0.0), see if possible to stream with UpdateRequestHandler
      *
-     * @param cs
+     * @param chunk  The chunk content as a string
      * @param fields
      * @param size
      *
      * @throws org.sleuthkit.autopsy.keywordsearch.Ingester.IngesterException
      */
-    void ingest(ContentStream cs, Map<String, String> fields, final long size) throws IngesterException {
+    private void indexChunk(String chunk, String sourceName, Map<String, String> fields) throws IngesterException {
         if (fields.get(Server.Schema.IMAGE_ID.toString()) == null) {
+            //JMTODO: actually if the we couldn't get the image id it is set to -1,
+            // but does this really mean we don't want to index it?
+
             //skip the file, image id unknown
-            String msg = NbBundle.getMessage(this.getClass(),
-                    "Ingester.ingest.exception.unknownImgId.msg", cs.getName());
+            String msg = NbBundle.getMessage(Ingester.class,
+                    "Ingester.ingest.exception.unknownImgId.msg", sourceName); //JMTODO: does this need to ne internationalized?
             logger.log(Level.SEVERE, msg);
             throw new IngesterException(msg);
         }
 
-        final byte[] docChunkContentBuf = new byte[MAX_DOC_CHUNK_SIZE];
+        //Make a SolrInputDocument out of the field map
         SolrInputDocument updateDoc = new SolrInputDocument();
-
         for (String key : fields.keySet()) {
             updateDoc.addField(key, fields.get(key));
         }
-
-        //using size here, but we are no longer ingesting entire files
-        //size is normally a chunk size, up to 1MB
-        if (size > 0) {
-            // TODO (RC): Use try with resources, adjust exception messages
-            InputStream is = null;
-            int read = 0;
-            try {
-                is = cs.getStream();
-                read = is.read(docChunkContentBuf);
-            } catch (IOException ex) {
-                throw new IngesterException(
-                        NbBundle.getMessage(this.getClass(), "Ingester.ingest.exception.cantReadStream.msg",
-                                cs.getName()));
-            } finally {
-                if (null != is) {
-                    try {
-                        is.close();
-                    } catch (IOException ex) {
-                        logger.log(Level.WARNING, "Could not close input stream after reading content, " + cs.getName(), ex); //NON-NLS
-                    }
-                }
-            }
-
-            if (read != 0) {
-                String s = "";
-                try {
-                    s = new String(docChunkContentBuf, 0, read, ENCODING);
-                    // Sanitize by replacing non-UTF-8 characters with caret '^' before adding to index
-                    char[] chars = null;
-                    for (int i = 0; i < s.length(); i++) {
-                        if (!TextUtil.isValidSolrUTF8(s.charAt(i))) {
-                            // only convert string to char[] if there is a non-UTF8 character
-                            if (chars == null) {
-                                chars = s.toCharArray();
-                            }
-                            chars[i] = '^';
-                        }
-                    }
-                    // check if the string was modified (i.e. there was a non-UTF8 character found)
-                    if (chars != null) {
-                        s = new String(chars);
-                    }
-                } catch (UnsupportedEncodingException ex) {
-                    logger.log(Level.SEVERE, "Unsupported encoding", ex); //NON-NLS
-                }
-                updateDoc.addField(Server.Schema.CONTENT.toString(), s);
-            } else {
-                updateDoc.addField(Server.Schema.CONTENT.toString(), "");
-            }
-        } else {
-            //no content, such as case when 0th chunk indexed
-            updateDoc.addField(Server.Schema.CONTENT.toString(), "");
-        }
+        //add the content to the SolrInputDocument
+        //JMTODO: can we just add it to the field map before passing that in?
+        updateDoc.addField(Server.Schema.CONTENT.toString(), chunk);
 
         try {
-            //TODO consider timeout thread, or vary socket timeout based on size of indexed content
+            //TODO: consider timeout thread, or vary socket timeout based on size of indexed content
             solrServer.addDocument(updateDoc);
             uncommitedIngests = true;
-        } catch (KeywordSearchModuleException ex) {
+
+        } catch (KeywordSearchModuleException | NoOpenCoreException ex) {
+            //JMTODO: does this need to be internationalized?
             throw new IngesterException(
-                    NbBundle.getMessage(this.getClass(), "Ingester.ingest.exception.err.msg", cs.getName()), ex);
+                    NbBundle.getMessage(Ingester.class, "Ingester.ingest.exception.err.msg", sourceName), ex);
         }
-
-    }
-
-    /**
-     * return timeout that should be used to index the content
-     *
-     * @param size size of the content
-     *
-     * @return time in seconds to use a timeout
-     */
-    static int getTimeout(long size) {
-        if (size < 1024 * 1024L) //1MB
-        {
-            return 60;
-        } else if (size < 10 * 1024 * 1024L) //10MB
-        {
-            return 1200;
-        } else if (size < 100 * 1024 * 1024L) //100MB
-        {
-            return 3600;
-        } else {
-            return 3 * 3600;
-        }
-
     }
 
     /**
@@ -377,92 +253,113 @@ class Ingester {
             uncommitedIngests = false;
         } catch (NoOpenCoreException | SolrServerException ex) {
             logger.log(Level.WARNING, "Error commiting index", ex); //NON-NLS
+
         }
     }
 
     /**
-     * ContentStream to read() the data from a FsContent object
+     * Visitor used to create fields to send to SOLR index.
      */
-    private static class FscContentStream implements ContentStream {
+    static private class SolrFieldsVisitor extends SleuthkitItemVisitor.Default<Map<String, String>> {
 
-        private AbstractFile f;
-
-        FscContentStream(AbstractFile f) {
-            this.f = f;
+        @Override
+        protected Map<String, String> defaultVisit(SleuthkitVisitableItem svi) {
+            return new HashMap<>();
         }
 
         @Override
-        public String getName() {
-            return f.getName();
+        public Map<String, String> visit(File f) {
+            return getCommonAndMACTimeFields(f);
         }
 
         @Override
-        public String getSourceInfo() {
-            return NbBundle.getMessage(this.getClass(), "Ingester.FscContentStream.getSrcInfo", f.getId());
+        public Map<String, String> visit(DerivedFile df) {
+            return getCommonAndMACTimeFields(df);
         }
 
         @Override
-        public String getContentType() {
-            return null;
+        public Map<String, String> visit(Directory d) {
+            return getCommonAndMACTimeFields(d);
         }
 
         @Override
-        public Long getSize() {
-            return f.getSize();
+        public Map<String, String> visit(LocalDirectory ld) {
+            return getCommonAndMACTimeFields(ld);
         }
 
         @Override
-        public InputStream getStream() throws IOException {
-            return new ReadContentInputStream(f);
+        public Map<String, String> visit(LayoutFile lf) {
+            // layout files do not have times
+            return getCommonFields(lf);
         }
 
         @Override
-        public Reader getReader() throws IOException {
-            throw new UnsupportedOperationException(
-                    NbBundle.getMessage(this.getClass(), "Ingester.FscContentStream.getReader"));
-        }
-    }
-
-    /**
-     * ContentStream associated with FsContent, but forced with no content
-     */
-    private static class NullContentStream implements ContentStream {
-
-        AbstractContent aContent;
-
-        NullContentStream(AbstractContent aContent) {
-            this.aContent = aContent;
+        public Map<String, String> visit(LocalFile lf) {
+            return getCommonAndMACTimeFields(lf);
         }
 
         @Override
-        public String getName() {
-            return aContent.getName();
+        public Map<String, String> visit(SlackFile f) {
+            return getCommonAndMACTimeFields(f);
         }
 
-        @Override
-        public String getSourceInfo() {
-            return NbBundle.getMessage(this.getClass(), "Ingester.NullContentStream.getSrcInfo.text", aContent.getId());
+        /**
+         * Get the field map for AbstractFiles that includes MAC times and the
+         * fields that are common to all file classes.
+         *
+         * @param file The file to get fields for
+         *
+         * @return The field map, including MAC times and common fields, for the
+         *         give file.
+         */
+        private Map<String, String> getCommonAndMACTimeFields(AbstractFile file) {
+            Map<String, String> params = getCommonFields(file);
+            params.put(Server.Schema.CTIME.toString(), ContentUtils.getStringTimeISO8601(file.getCtime(), file));
+            params.put(Server.Schema.ATIME.toString(), ContentUtils.getStringTimeISO8601(file.getAtime(), file));
+            params.put(Server.Schema.MTIME.toString(), ContentUtils.getStringTimeISO8601(file.getMtime(), file));
+            params.put(Server.Schema.CRTIME.toString(), ContentUtils.getStringTimeISO8601(file.getCrtime(), file));
+            return params;
         }
 
-        @Override
-        public String getContentType() {
-            return null;
+        /**
+         * Get the field map for AbstractFiles that is common to all file
+         * classes
+         *
+         * @param file The file to get fields for
+         *
+         * @return The field map of fields that are common to all file classes.
+         */
+        private Map<String, String> getCommonFields(AbstractFile file) {
+            Map<String, String> params = new HashMap<>();
+            params.put(Server.Schema.ID.toString(), Long.toString(file.getId()));
+            try {
+                params.put(Server.Schema.IMAGE_ID.toString(), Long.toString(file.getDataSource().getId()));
+            } catch (TskCoreException ex) {
+                logger.log(Level.SEVERE, "Could not get data source id to properly index the file " + file.getId(), ex); //NON-NLS
+                params.put(Server.Schema.IMAGE_ID.toString(), Long.toString(-1));
+            }
+            params.put(Server.Schema.FILE_NAME.toString(), file.getName());
+            return params;
         }
 
+        /**
+         * Get the field map for artifacts.
+         *
+         * @param artifact The artifact to get fields for.
+         *
+         * @return The field map for the given artifact.
+         */
         @Override
-        public Long getSize() {
-            return 0L;
-        }
-
-        @Override
-        public InputStream getStream() throws IOException {
-            return new ByteArrayInputStream(new byte[0]);
-        }
-
-        @Override
-        public Reader getReader() throws IOException {
-            throw new UnsupportedOperationException(
-                    NbBundle.getMessage(this.getClass(), "Ingester.NullContentStream.getReader"));
+        public Map<String, String> visit(BlackboardArtifact artifact) {
+            Map<String, String> params = new HashMap<>();
+            params.put(Server.Schema.ID.toString(), Long.toString(artifact.getArtifactID()));
+            try {
+                params.put(Server.Schema.IMAGE_ID.toString(), Long.toString(ArtifactTextExtractor.getDataSource(artifact).getId()));
+            } catch (TskCoreException ex) {
+                logger.log(Level.SEVERE, "Could not get data source id to properly index the artifact " + artifact.getArtifactID(), ex); //NON-NLS
+                params.put(Server.Schema.IMAGE_ID.toString(), Long.toString(-1));
+            }
+            return params;
         }
     }
 

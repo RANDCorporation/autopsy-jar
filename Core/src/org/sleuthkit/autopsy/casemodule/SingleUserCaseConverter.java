@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2015 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,19 +34,21 @@ import java.util.Date;
 import org.apache.commons.io.FileUtils;
 import org.openide.util.NbBundle;
 import org.sleuthkit.autopsy.casemodule.Case.CaseType;
-import static org.sleuthkit.autopsy.casemodule.Case.MODULE_FOLDER;
 import org.sleuthkit.autopsy.core.UserPreferences;
 import org.sleuthkit.autopsy.core.UserPreferencesException;
+import org.sleuthkit.autopsy.coreutils.NetworkUtils;
 import org.sleuthkit.datamodel.CaseDbConnectionInfo;
 import org.sleuthkit.datamodel.SleuthkitCase;
-import org.sleuthkit.autopsy.coreutils.NetworkUtils;
 import org.sleuthkit.datamodel.TskData;
 
 /**
  * Import a case from single-user to multi-user.
+ *
+ * DO NOT USE, NEEDS TO BE UPDATED
  */
 public class SingleUserCaseConverter {
 
+    private static final String MODULE_FOLDER = "ModuleOutput"; //NON-NLS    
     private static final String AUTOPSY_DB_FILE = "autopsy.db"; //NON-NLS
     private static final String DOTAUT = CaseMetadata.getFileExtension(); //NON-NLS
     private static final String TIMELINE_FOLDER = "Timeline"; //NON-NLS
@@ -173,10 +175,15 @@ public class SingleUserCaseConverter {
         }
 
         // Create sanitized names for PostgreSQL and Solr 
+        /*
+         * RJC: Removed package access sanitizeCaseName method, so this is no
+         * longer correct, but this whole class is currently out-of-date (out of
+         * synch with case database schema) and probably belongs in the TSK
+         * layer anyway, see JIRA-1984.
+         */
         SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMdd_HHmmss"); //NON-NLS
         Date date = new Date();
-        String dbName = Case.sanitizeCaseName(icd.getNewCaseName()) + "_" + dateFormat.format(date); //NON-NLS
-        String solrName = dbName;
+        String dbName = icd.getNewCaseName() + "_" + dateFormat.format(date); //NON-NLS
         icd.setPostgreSQLDbName(dbName);
 
         // Copy items to new hostname folder structure
@@ -192,12 +199,16 @@ public class SingleUserCaseConverter {
         copyImages(icd);
 
         // Create new .aut file
-        CaseMetadata newCaseMetadata = new CaseMetadata(icd.getCaseOutputFolder().toString(),
-                CaseType.MULTI_USER_CASE,
+        CaseMetadata newCaseMetadata = new CaseMetadata(CaseType.MULTI_USER_CASE,
+                icd.getCaseOutputFolder().toString(),
                 icd.getNewCaseName(),
+                new CaseDetails(icd.getNewCaseName(),
                 oldCaseMetadata.getCaseNumber(),
                 oldCaseMetadata.getExaminer(),
-                dbName, solrName);
+                oldCaseMetadata.getExaminerPhone(),
+                oldCaseMetadata.getExaminerEmail(),
+                oldCaseMetadata.getCaseNotes()));
+        newCaseMetadata.setCaseDatabaseName(dbName);
         // Set created date. This calls writefile, no need to call it again
         newCaseMetadata.setCreatedDate(oldCaseMetadata.getCreatedDate());
         newCaseMetadata.setCreatedByVersion(oldCaseMetadata.getCreatedByVersion());
@@ -491,12 +502,12 @@ public class SingleUserCaseConverter {
                 if (value > biggestPK) {
                     biggestPK = value;
                 }
-                
+
                 // If the entry contains an encoding type, copy it. Otherwise use NONE.
                 // The test on column count can be removed if we upgrade the database before conversion.
                 int encoding = TskData.EncodingType.NONE.getType();
                 ResultSetMetaData rsMetaData = inputResultSet.getMetaData();
-                if(rsMetaData.getColumnCount() == 3){
+                if (rsMetaData.getColumnCount() == 3) {
                     encoding = inputResultSet.getInt(3);
                 }
                 outputStatement.executeUpdate("INSERT INTO tsk_files_path (obj_id, path, encoding_type) VALUES (" //NON-NLS

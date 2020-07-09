@@ -1,19 +1,19 @@
 /*
  *
  * Autopsy Forensic Browser
- * 
+ *
  * Copyright 2012-2014 Basis Technology Corp.
- * 
+ *
  * Copyright 2012 42six Solutions.
  * Contact: aebadirad <at> 42six <dot> com
  * Project Contact/Architect: carrier <at> sleuthkit <dot> org
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -22,6 +22,7 @@
  */
 package org.sleuthkit.autopsy.report;
 
+import java.awt.image.BufferedImage;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -32,15 +33,19 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.UnsupportedEncodingException;
 import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.logging.Level;
-import org.openide.filesystems.FileObject;
+import javax.imageio.ImageIO;
 import org.openide.filesystems.FileUtil;
 import org.openide.util.NbBundle;
 import org.sleuthkit.autopsy.casemodule.Case;
@@ -58,6 +63,7 @@ import org.sleuthkit.datamodel.ContentTag;
 import org.sleuthkit.datamodel.Image;
 import org.sleuthkit.datamodel.SleuthkitCase;
 import org.sleuthkit.datamodel.TskCoreException;
+import org.sleuthkit.datamodel.TskData;
 import org.sleuthkit.datamodel.TskData.TSK_DB_FILES_TYPE_ENUM;
 
 class ReportHTML implements TableReportModule {
@@ -265,7 +271,8 @@ class ReportHTML implements TableReportModule {
                     break;
             }
         } else if (dataType.startsWith(ARTIFACT_TYPE.TSK_ACCOUNT.getDisplayName())) {
-            /* TSK_ACCOUNT artifacts get separated by their TSK_ACCOUNT_TYPE
+            /*
+             * TSK_ACCOUNT artifacts get separated by their TSK_ACCOUNT_TYPE
              * attribute, with a synthetic compound dataType name, so they are
              * not caught by the switch statement above. For now we just give
              * them all the general account icon, but we could do something else
@@ -583,7 +590,7 @@ class ReportHTML implements TableReportModule {
             // save it in a folder based on the tag name
             String localFilePath = saveContent(file, contentTag.getName().getDisplayName());
             localFileLink.append(localFilePath);
-            localFileLink.append("\">");
+            localFileLink.append("\" target=\"_top\">");
         }
 
         StringBuilder builder = new StringBuilder();
@@ -617,10 +624,10 @@ class ReportHTML implements TableReportModule {
      *
      * @param images
      */
-    public void addThumbnailRows(List<Content> images) {
+    public void addThumbnailRows(Set<Content> images) {
         List<String> currentRow = new ArrayList<>();
         int totalCount = 0;
-        int pages = 0;
+        int pages = 1;
         for (Content content : images) {
             if (currentRow.size() == THUMBNAIL_COLUMNS) {
                 addRow(currentRow);
@@ -628,7 +635,7 @@ class ReportHTML implements TableReportModule {
             }
 
             if (totalCount == MAX_THUMBS_PER_PAGE) {
-                // manually set the row count so the count of items shown in the 
+                // manually set the row count so the count of items shown in the
                 // navigation page reflects the number of thumbnails instead of
                 // the number of rows.
                 rowCount = totalCount;
@@ -665,9 +672,10 @@ class ReportHTML implements TableReportModule {
             }
 
             StringBuilder linkToThumbnail = new StringBuilder();
+            linkToThumbnail.append("<div id='thumbnail_link'>");
             linkToThumbnail.append("<a href=\""); //NON-NLS
             linkToThumbnail.append(contentPath);
-            linkToThumbnail.append("\">");
+            linkToThumbnail.append("\" target=\"_top\">");
             linkToThumbnail.append("<img src=\"").append(thumbnailPath).append("\" title=\"").append(nameInImage).append("\"/>"); //NON-NLS
             linkToThumbnail.append("</a><br>"); //NON-NLS
             linkToThumbnail.append(file.getName()).append("<br>"); //NON-NLS
@@ -681,7 +689,8 @@ class ReportHTML implements TableReportModule {
                 }
                 for (int i = 0; i < tags.size(); i++) {
                     ContentTag tag = tags.get(i);
-                    linkToThumbnail.append(tag.getName().getDisplayName());
+                    String notableString = tag.getName().getKnownStatus() == TskData.FileKnown.BAD ? TagsManager.getNotableTagLabel() : "";
+                    linkToThumbnail.append(tag.getName().getDisplayName() + notableString);
                     if (i != tags.size() - 1) {
                         linkToThumbnail.append(", ");
                     }
@@ -689,7 +698,7 @@ class ReportHTML implements TableReportModule {
             } catch (TskCoreException ex) {
                 logger.log(Level.WARNING, "Could not find get tags for file.", ex); //NON-NLS
             }
-
+            linkToThumbnail.append("</div>");
             currentRow.add(linkToThumbnail.toString());
 
             totalCount++;
@@ -759,7 +768,7 @@ class ReportHTML implements TableReportModule {
         localFilePath.append(File.separator);
         localFilePath.append(fileName);
 
-        // If the local file doesn't already exist, create it now. 
+        // If the local file doesn't already exist, create it now.
         // The existence check is necessary because it is possible to apply multiple tags with the same tagName to a file.
         File localFile = new File(localFilePath.toString());
         if (!localFile.exists()) {
@@ -805,24 +814,43 @@ class ReportHTML implements TableReportModule {
         Writer cssOut = null;
         try {
             cssOut = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(path + "index.css"), "UTF-8")); //NON-NLS NON-NLS
-            String css = "body {margin: 0px; padding: 0px; background: #FFFFFF; font: 13px/20px Arial, Helvetica, sans-serif; color: #535353;}\n" + //NON-NLS
-                    "#content {padding: 30px;}\n" + //NON-NLS
-                    "#header {width:100%; padding: 10px; line-height: 25px; background: #07A; color: #FFF; font-size: 20px;}\n" + //NON-NLS
-                    "h1 {font-size: 20px; font-weight: normal; color: #07A; padding: 0 0 7px 0; margin-top: 25px; border-bottom: 1px solid #D6D6D6;}\n" + //NON-NLS
-                    "h2 {font-size: 20px; font-weight: bolder; color: #07A;}\n" + //NON-NLS
-                    "h3 {font-size: 16px; color: #07A;}\n" + //NON-NLS
-                    "h4 {background: #07A; color: #FFF; font-size: 16px; margin: 0 0 0 25px; padding: 0; padding-left: 15px;}\n" + //NON-NLS
-                    "ul.nav {list-style-type: none; line-height: 35px; padding: 0px; margin-left: 15px;}\n" + //NON-NLS
-                    "ul li a {font-size: 14px; color: #444; text-decoration: none; padding-left: 25px;}\n" + //NON-NLS
-                    "ul li a:hover {text-decoration: underline;}\n" + //NON-NLS
-                    "p {margin: 0 0 20px 0;}\n" + //NON-NLS
-                    "table {white-space:nowrap; min-width: 700px; padding: 2; margin: 0; border-collapse: collapse; border-bottom: 2px solid #e5e5e5;}\n" + //NON-NLS
-                    ".keyword_list table {margin: 0 0 25px 25px; border-bottom: 2px solid #dedede;}\n" + //NON-NLS
-                    "table th {white-space:nowrap; display: table-cell; text-align: center; padding: 2px 4px; background: #e5e5e5; color: #777; font-size: 11px; text-shadow: #e9f9fd 0 1px 0; border-top: 1px solid #dedede; border-bottom: 2px solid #e5e5e5;}\n" + //NON-NLS
-                    "table .left_align_cell{display: table-cell; padding: 2px 4px; font: 13px/20px Arial, Helvetica, sans-serif; min-width: 125px; overflow: auto; text-align: left; }\n" + //NON-NLS
-                    "table .right_align_cell{display: table-cell; padding: 2px 4px; font: 13px/20px Arial, Helvetica, sans-serif; min-width: 125px; overflow: auto; text-align: right; }\n" + //NON-NLS
-                    "table td {white-space:nowrap; display: table-cell; padding: 2px 3px; font: 13px/20px Arial, Helvetica, sans-serif; min-width: 125px; overflow: auto; text-align:left; }\n" + //NON-NLS
-                    "table tr:nth-child(even) td {background: #f3f3f3;}"; //NON-NLS
+            String css = "body {margin: 0px; padding: 0px; background: #FFFFFF; font: 13px/20px Arial, Helvetica, sans-serif; color: #535353;}\n"
+                    + //NON-NLS
+                    "#content {padding: 30px;}\n"
+                    + //NON-NLS
+                    "#header {width:100%; padding: 10px; line-height: 25px; background: #07A; color: #FFF; font-size: 20px;}\n"
+                    + //NON-NLS
+                    "h1 {font-size: 20px; font-weight: normal; color: #07A; padding: 0 0 7px 0; margin-top: 25px; border-bottom: 1px solid #D6D6D6;}\n"
+                    + //NON-NLS
+                    "h2 {font-size: 20px; font-weight: bolder; color: #07A;}\n"
+                    + //NON-NLS
+                    "h3 {font-size: 16px; color: #07A;}\n"
+                    + //NON-NLS
+                    "h4 {background: #07A; color: #FFF; font-size: 16px; margin: 0 0 0 25px; padding: 0; padding-left: 15px;}\n"
+                    + //NON-NLS
+                    "ul.nav {list-style-type: none; line-height: 35px; padding: 0px; margin-left: 15px;}\n"
+                    + //NON-NLS
+                    "ul li a {font-size: 14px; color: #444; text-decoration: none; padding-left: 25px;}\n"
+                    + //NON-NLS
+                    "ul li a:hover {text-decoration: underline;}\n"
+                    + //NON-NLS
+                    "p {margin: 0 0 20px 0;}\n"
+                    + //NON-NLS
+                    "table {white-space:nowrap; min-width: 700px; padding: 2; margin: 0; border-collapse: collapse; border-bottom: 2px solid #e5e5e5;}\n"
+                    + //NON-NLS
+                    ".keyword_list table {margin: 0 0 25px 25px; border-bottom: 2px solid #dedede;}\n"
+                    + //NON-NLS
+                    "table th {white-space:nowrap; display: table-cell; text-align: center; padding: 2px 4px; background: #e5e5e5; color: #777; font-size: 11px; text-shadow: #e9f9fd 0 1px 0; border-top: 1px solid #dedede; border-bottom: 2px solid #e5e5e5;}\n"
+                    + //NON-NLS
+                    "table .left_align_cell{display: table-cell; padding: 2px 4px; font: 13px/20px Arial, Helvetica, sans-serif; min-width: 125px; overflow: auto; text-align: left; }\n"
+                    + //NON-NLS
+                    "table .right_align_cell{display: table-cell; padding: 2px 4px; font: 13px/20px Arial, Helvetica, sans-serif; min-width: 125px; overflow: auto; text-align: right; }\n"
+                    + //NON-NLS
+                    "table td {white-space:nowrap; display: table-cell; padding: 2px 3px; font: 13px/20px Arial, Helvetica, sans-serif; min-width: 125px; overflow: auto; text-align:left; vertical-align: text-top;}\n"
+                    + //NON-NLS
+                    "table tr:nth-child(even) td {background: #f3f3f3;}\n"
+                    + //NON-NLS 
+                    "div#thumbnail_link {max-width: 200px; white-space: pre-wrap; white-space: -moz-pre-wrap; white-space: -pre-wrap; white-space: -o-pre-wrap; word-wrap: break-word;}";
             cssOut.write(css);
         } catch (FileNotFoundException ex) {
             logger.log(Level.SEVERE, "Could not find index.css file to write to.", ex); //NON-NLS
@@ -855,9 +883,11 @@ class ReportHTML implements TableReportModule {
             if (iconPath == null) {
                 // use default Autopsy icon if custom icon is not set
                 iconPath = "favicon.ico";
+            } else {
+                iconPath = Paths.get(reportBranding.getAgencyLogoPath()).getFileName().toString(); //ref to writeNav() for agency_logo
             }
             index.append("<head>\n<title>").append(reportTitle).append(" ").append(
-                    NbBundle.getMessage(this.getClass(), "ReportHTML.writeIndex.title", currentCase.getName())).append(
+                    NbBundle.getMessage(this.getClass(), "ReportHTML.writeIndex.title", currentCase.getDisplayName())).append(
                     "</title>\n"); //NON-NLS
             index.append("<link rel=\"icon\" type=\"image/ico\" href=\"")
                     .append(iconPath).append("\" />\n"); //NON-NLS
@@ -947,9 +977,8 @@ class ReportHTML implements TableReportModule {
 
             String agencyLogoPath = reportBranding.getAgencyLogoPath();
             if (agencyLogoPath != null && !agencyLogoPath.isEmpty()) {
-                File from = new File(agencyLogoPath);
-                File to = new File(path);
-                FileUtil.copyFile(FileUtil.toFileObject(from), FileUtil.toFileObject(to), "agency_logo"); //NON-NLS
+                Path destinationPath = Paths.get(path);
+                Files.copy(Files.newInputStream(Paths.get(agencyLogoPath)), destinationPath.resolve(Paths.get(agencyLogoPath).getFileName())); //NON-NLS     
             }
 
             in = getClass().getResourceAsStream("/org/sleuthkit/autopsy/report/images/favicon.ico"); //NON-NLS
@@ -1017,7 +1046,7 @@ class ReportHTML implements TableReportModule {
             Date date = new Date();
             String datetime = datetimeFormat.format(date);
 
-            String caseName = currentCase.getName();
+            String caseName = currentCase.getDisplayName();
             String caseNumber = currentCase.getNumber();
             String examiner = currentCase.getExaminer();
             int imagecount;
@@ -1047,7 +1076,9 @@ class ReportHTML implements TableReportModule {
             summary.append("<div class=\"title\">\n"); //NON-NLS
             if (agencyLogoSet) {
                 summary.append("<div class=\"left\">\n"); //NON-NLS
-                summary.append("<img src=\"agency_logo.png\" />\n"); //NON-NLS
+                summary.append("<img src=\"");
+                summary.append(Paths.get(reportBranding.getAgencyLogoPath()).getFileName().toString());
+                summary.append("\" />\n"); //NON-NLS
                 summary.append("</div>\n"); //NON-NLS
             }
             final String align = agencyLogoSet ? "right" : "left"; //NON-NLS NON-NLS
@@ -1122,24 +1153,23 @@ class ReportHTML implements TableReportModule {
     }
 
     private String prepareThumbnail(AbstractFile file) {
-        File thumbFile = ImageUtils.getCachedThumbnailFile(file, ImageUtils.ICON_SIZE_MEDIUM);
-        if (thumbFile.exists() == false) {
+        BufferedImage bufferedThumb = ImageUtils.getThumbnail(file, ImageUtils.ICON_SIZE_MEDIUM);
+        File thumbFile = Paths.get(thumbsPath, file.getName() + ".png").toFile();
+        if (bufferedThumb == null) {
             return null;
         }
-        File to = new File(thumbsPath);
-        FileObject from = FileUtil.toFileObject(thumbFile);
-        FileObject dest = FileUtil.toFileObject(to);
         try {
-            FileUtil.copyFile(from, dest, thumbFile.getName(), "");
+            ImageIO.write(bufferedThumb, "png", thumbFile);
         } catch (IOException ex) {
-            logger.log(Level.SEVERE, "Failed to write thumb file to report directory.", ex); //NON-NLS
-        } catch (NullPointerException ex) {
-            logger.log(Level.SEVERE, "NPE generated from FileUtil.copyFile, probably because FileUtil.toFileObject returned null. \n" +
-                    "The File argument for toFileObject was " + thumbFile + " with toString: " + thumbFile.toString() + "\n" +
-                    "The FileObject returned by toFileObject, passed into FileUtil.copyFile, was " + from, ex);
+            logger.log(Level.WARNING, "Failed to write thumb file to report directory.", ex); //NON-NLS
+            return null;
         }
-
-        return THUMBS_REL_PATH + thumbFile.getName();
+        if (thumbFile.exists()
+                == false) {
+            return null;
+        }
+        return THUMBS_REL_PATH
+                + thumbFile.getName();
     }
 
 }

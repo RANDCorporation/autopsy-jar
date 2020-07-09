@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2013-2016 Basis Technology Corp.
+ * Copyright 2013-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,11 +26,12 @@ import javax.swing.JPanel;
 import org.openide.util.NbBundle;
 import org.openide.util.lookup.ServiceProvider;
 import org.openide.util.lookup.ServiceProviders;
-import org.sleuthkit.autopsy.corecomponentinterfaces.AutomatedIngestDataSourceProcessor;
 import org.sleuthkit.autopsy.corecomponentinterfaces.DataSourceProcessorCallback;
 import org.sleuthkit.autopsy.corecomponentinterfaces.DataSourceProcessorProgressMonitor;
 import org.sleuthkit.autopsy.corecomponentinterfaces.DataSourceProcessor;
 import org.sleuthkit.autopsy.coreutils.DriveUtils;
+import org.sleuthkit.autopsy.imagewriter.ImageWriterSettings;
+import org.sleuthkit.autopsy.datasourceprocessors.AutoIngestDataSourceProcessor;
 
 /**
  * A local drive data source processor that implements the DataSourceProcessor
@@ -38,11 +39,11 @@ import org.sleuthkit.autopsy.coreutils.DriveUtils;
  * wizard. It also provides a run method overload to allow it to be used
  * independently of the wizard.
  */
-@ServiceProviders(value={
-    @ServiceProvider(service=DataSourceProcessor.class),
-    @ServiceProvider(service=AutomatedIngestDataSourceProcessor.class)}
+@ServiceProviders(value = {
+    @ServiceProvider(service = DataSourceProcessor.class),
+    @ServiceProvider(service = AutoIngestDataSourceProcessor.class)}
 )
-public class LocalDiskDSProcessor implements AutomatedIngestDataSourceProcessor {
+public class LocalDiskDSProcessor implements DataSourceProcessor, AutoIngestDataSourceProcessor {
 
     private static final String DATA_SOURCE_TYPE = NbBundle.getMessage(LocalDiskDSProcessor.class, "LocalDiskDSProcessor.dsType.text");
     private final LocalDiskPanel configPanel;
@@ -54,6 +55,7 @@ public class LocalDiskDSProcessor implements AutomatedIngestDataSourceProcessor 
     private String deviceId;
     private String drivePath;
     private String timeZone;
+    private ImageWriterSettings imageWriterSettings;
     private boolean ignoreFatOrphanFiles;
     private boolean setDataSourceOptionsCalled;
 
@@ -100,7 +102,7 @@ public class LocalDiskDSProcessor implements AutomatedIngestDataSourceProcessor 
      */
     @Override
     public JPanel getPanel() {
-        configPanel.select();
+        configPanel.refreshTable();
         return configPanel;
     }
 
@@ -137,8 +139,13 @@ public class LocalDiskDSProcessor implements AutomatedIngestDataSourceProcessor 
             drivePath = configPanel.getContentPaths();
             timeZone = configPanel.getTimeZone();
             ignoreFatOrphanFiles = configPanel.getNoFatOrphans();
+            if (configPanel.getImageWriterEnabled()) {
+                imageWriterSettings = configPanel.getImageWriterSettings();
+            } else {
+                imageWriterSettings = null;
+            }
         }
-        addDiskTask = new AddImageTask(deviceId, drivePath, timeZone, ignoreFatOrphanFiles, progressMonitor, callback);
+        addDiskTask = new AddImageTask(deviceId, drivePath, timeZone, ignoreFatOrphanFiles, imageWriterSettings, progressMonitor, callback);
         new Thread(addDiskTask).start();
     }
 
@@ -164,7 +171,7 @@ public class LocalDiskDSProcessor implements AutomatedIngestDataSourceProcessor 
      * @param callback             Callback to call when processing is done.
      */
     public void run(String deviceId, String drivePath, String timeZone, boolean ignoreFatOrphanFiles, DataSourceProcessorProgressMonitor progressMonitor, DataSourceProcessorCallback callback) {
-        addDiskTask = new AddImageTask(deviceId, drivePath, timeZone, ignoreFatOrphanFiles, progressMonitor, callback);
+        addDiskTask = new AddImageTask(deviceId, drivePath, timeZone, ignoreFatOrphanFiles, imageWriterSettings, progressMonitor, callback);
         new Thread(addDiskTask).start();
     }
 
@@ -188,12 +195,42 @@ public class LocalDiskDSProcessor implements AutomatedIngestDataSourceProcessor 
      */
     @Override
     public void reset() {
-        configPanel.reset();
         deviceId = null;
         drivePath = null;
         timeZone = null;
         ignoreFatOrphanFiles = false;
         setDataSourceOptionsCalled = false;
+    }
+
+    @Override
+    public int canProcess(Path dataSourcePath) throws AutoIngestDataSourceProcessorException {
+
+        // verify that the data source is not a file or a directory
+        File file = dataSourcePath.toFile();
+        // ELTODO this needs to be tested more. should I keep isDirectory or just test for isFile?
+        if (file.isFile() || file.isDirectory()) {
+            return 0;
+        }
+
+        // check whether data source is an existing disk or partition
+        // ELTODO this needs to be tested more. do these methods actually work correctly? 
+        // or should I use PlatformUtil.getPhysicalDrives() and PlatformUtil.getPartitions() instead?
+        String path = dataSourcePath.toString();
+        if ((DriveUtils.isPhysicalDrive(path) || DriveUtils.isPartition(path)) && DriveUtils.driveExists(path)) {
+            return 90;
+        }
+
+        return 0;
+    }
+
+    @Override
+    public void process(String deviceId, Path dataSourcePath, DataSourceProcessorProgressMonitor progressMonitor, DataSourceProcessorCallback callBack) throws AutoIngestDataSourceProcessorException {
+        this.deviceId = deviceId;
+        this.drivePath = dataSourcePath.toString();
+        this.timeZone = Calendar.getInstance().getTimeZone().getID();
+        this.ignoreFatOrphanFiles = false;
+        setDataSourceOptionsCalled = true;
+        run(deviceId, drivePath, timeZone, ignoreFatOrphanFiles, progressMonitor, callBack);
     }
 
     /**
@@ -216,37 +253,6 @@ public class LocalDiskDSProcessor implements AutomatedIngestDataSourceProcessor 
         this.timeZone = Calendar.getInstance().getTimeZone().getID();
         this.ignoreFatOrphanFiles = ignoreFatOrphanFiles;
         setDataSourceOptionsCalled = true;
-    }
-
-    @Override
-    public int canProcess(Path dataSourcePath) throws AutomatedIngestDataSourceProcessorException {
-        
-        // verify that the data source is not a file or a directory
-        File file = dataSourcePath.toFile();
-        // ELTODO this needs to be tested more. should I keep isDirectory or just test for isFile?
-        if (file.isFile() || file.isDirectory()) {
-            return 0;
-        }
-        
-        // check whether data source is an existing disk or partition
-        // ELTODO this needs to be tested more. do these methods actually work correctly? 
-        // or should I use PlatformUtil.getPhysicalDrives() and PlatformUtil.getPartitions() instead?
-        String path = dataSourcePath.toString();
-        if ( (DriveUtils.isPhysicalDrive(path) || DriveUtils.isPartition(path)) && DriveUtils.driveExists(path) ) {
-            return 90;
-        }
-        
-        return 0;
-    }
-
-    @Override
-    public void process(String deviceId, Path dataSourcePath, DataSourceProcessorProgressMonitor progressMonitor, DataSourceProcessorCallback callBack) throws AutomatedIngestDataSourceProcessorException {
-        this.deviceId = deviceId;
-        this.drivePath = dataSourcePath.toString();
-        this.timeZone = Calendar.getInstance().getTimeZone().getID();
-        this.ignoreFatOrphanFiles = false;
-        setDataSourceOptionsCalled = true;        
-        run(deviceId, drivePath, timeZone, ignoreFatOrphanFiles, progressMonitor, callBack);
     }
 
 }

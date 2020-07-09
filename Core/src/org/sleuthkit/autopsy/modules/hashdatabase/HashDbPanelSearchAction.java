@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2014 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@ import java.awt.event.ActionListener;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.beans.PropertyChangeEvent;
-import java.beans.PropertyChangeListener;
+import java.util.EnumSet;
 import org.openide.util.HelpCtx;
 import org.openide.util.NbBundle;
 import org.openide.util.actions.CallableSystemAction;
@@ -36,20 +36,16 @@ import org.sleuthkit.autopsy.corecomponents.AdvancedConfigurationCleanDialog;
  */
 class HashDbPanelSearchAction extends CallableSystemAction {
 
+    private static final long serialVersionUID = 1L;
     static final String ACTION_NAME = NbBundle.getMessage(HashDbPanelSearchAction.class, "HashDbPanelSearchAction.actionName");
     private static HashDbPanelSearchAction instance = null;
 
     HashDbPanelSearchAction() {
         super();
-        setEnabled(Case.isCaseOpen()); //no guarantee listener executed, so check here
-
-        Case.addPropertyChangeListener(new PropertyChangeListener() {
-
-            @Override
-            public void propertyChange(PropertyChangeEvent evt) {
-                if (evt.getPropertyName().equals(Case.Events.CURRENT_CASE.toString())) {
-                    setEnabled(evt.getNewValue() != null);
-                }
+        setEnabled(Case.isCaseOpen());
+        Case.addEventTypeSubscriber(EnumSet.of(Case.Events.CURRENT_CASE), (PropertyChangeEvent evt) -> {
+            if (evt.getPropertyName().equals(Case.Events.CURRENT_CASE.toString())) {
+                setEnabled(evt.getNewValue() != null);
             }
         });
     }

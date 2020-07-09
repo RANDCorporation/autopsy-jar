@@ -18,6 +18,8 @@
  */
 package org.sleuthkit.autopsy.coreutils;
 
+import org.sleuthkit.autopsy.core.RuntimeProperties;
+
 import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.logging.FileHandler;
@@ -42,8 +44,8 @@ public final class Logger extends java.util.logging.Logger {
     private static final String LOG_WITH_STACK_TRACES = "autopsy_traces.log"; //NON-NLS
     private static final Map<String, Logger> namesToLoggers = new HashMap<>();
     private static final Handler consoleHandler = new java.util.logging.ConsoleHandler();
-    private static FileHandler userFriendlyHandler = createFileHandlerWithoutTraces(PlatformUtil.getLogDirectory());
-    private static FileHandler developerFriendlyHandler = createFileHandlerWithTraces(PlatformUtil.getLogDirectory());
+    private static FileHandler userFriendlyHandler = RuntimeProperties.runningWithGUI() ? createFileHandlerWithoutTraces(PlatformUtil.getLogDirectory()) : null;
+    private static FileHandler developerFriendlyHandler = RuntimeProperties.runningWithGUI() ?createFileHandlerWithTraces(PlatformUtil.getLogDirectory()) : null;
 
     /**
      * Creates a custom file handler with a custom message formatter that does
@@ -143,9 +145,13 @@ public final class Logger extends java.util.logging.Logger {
          * and the two overloads of getLogger() are synchronized, serializing
          * access to userFriendlyHandler and developerFriendlyHandler.
          */
-        userFriendlyHandler.close();
+        if (userFriendlyHandler != null){
+            userFriendlyHandler.close();
+        }
         userFriendlyHandler = newUserFriendlyHandler;
-        developerFriendlyHandler.close();
+        if (developerFriendlyHandler != null){
+            developerFriendlyHandler.close();
+        }
         developerFriendlyHandler = newDeveloperFriendlyHandler;
     }
 

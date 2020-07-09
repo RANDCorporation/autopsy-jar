@@ -295,11 +295,15 @@ public final class ThunderbirdMboxFileIngestModule implements FileIngestModule {
      */
     private void processEmails(List<EmailMessage> emails, AbstractFile abstractFile) {
         List<AbstractFile> derivedFiles = new ArrayList<>();
+        
+       
+        
         for (EmailMessage email : emails) {
-            if (email.hasAttachment()) {
-                derivedFiles.addAll(handleAttachments(email.getAttachments(), abstractFile));
+            BlackboardArtifact msgArtifact = addArtifact(email, abstractFile);
+             
+            if ((msgArtifact != null) && (email.hasAttachment()))  {
+                derivedFiles.addAll(handleAttachments(email.getAttachments(), abstractFile, msgArtifact ));
             }
-            addArtifact(email, abstractFile);
         }
 
         if (derivedFiles.isEmpty() == false) {
@@ -317,10 +321,11 @@ public final class ThunderbirdMboxFileIngestModule implements FileIngestModule {
      *
      * @param attachments
      * @param abstractFile
+     * @param messageArtifact
      *
-     * @return
+     * @return List of attachments
      */
-    private List<AbstractFile> handleAttachments(List<EmailMessage.Attachment> attachments, AbstractFile abstractFile) {
+    private List<AbstractFile> handleAttachments(List<EmailMessage.Attachment> attachments, AbstractFile abstractFile, BlackboardArtifact messageArtifact) {
         List<AbstractFile> files = new ArrayList<>();
         for (EmailMessage.Attachment attach : attachments) {
             String filename = attach.getName();
@@ -334,7 +339,7 @@ public final class ThunderbirdMboxFileIngestModule implements FileIngestModule {
 
             try {
                 DerivedFile df = fileManager.addDerivedFile(filename, relPath,
-                        size, cTime, crTime, aTime, mTime, true, abstractFile, "",
+                        size, cTime, crTime, aTime, mTime, true, messageArtifact, "",
                         EmailParserModuleFactory.getModuleName(), EmailParserModuleFactory.getModuleVersion(), "", encodingType);
                 files.add(df);
             } catch (TskCoreException ex) {
@@ -356,13 +361,15 @@ public final class ThunderbirdMboxFileIngestModule implements FileIngestModule {
      * @param abstractFile
      */
     @Messages({"ThunderbirdMboxFileIngestModule.addArtifact.indexError.message=Failed to index email message detected artifact for keyword search."})
-    private void addArtifact(EmailMessage email, AbstractFile abstractFile) {
+    private BlackboardArtifact addArtifact(EmailMessage email, AbstractFile abstractFile) {
+        BlackboardArtifact bbart = null;
         List<BlackboardAttribute> bbattributes = new ArrayList<>();
         String to = email.getRecipients();
         String cc = email.getCc();
         String bcc = email.getBcc();
         String from = email.getSender();
         long dateL = email.getSentDate();
+        String headers = email.getHeaders();
         String body = email.getTextBody();
         String bodyHTML = email.getHtmlBody();
         String rtf = email.getRtfBody();
@@ -370,18 +377,19 @@ public final class ThunderbirdMboxFileIngestModule implements FileIngestModule {
         long id = email.getId();
         String localPath = email.getLocalPath();
 
-        if (to.isEmpty() == false) {
-            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_TO, EmailParserModuleFactory.getModuleName(), to));
-        }
-        if (cc.isEmpty() == false) {
-            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_CC, EmailParserModuleFactory.getModuleName(), cc));
-        }
-        if (bcc.isEmpty() == false) {
-            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_BCC, EmailParserModuleFactory.getModuleName(), bcc));
+        if (headers.isEmpty() == false) {
+             bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_HEADERS, EmailParserModuleFactory.getModuleName(), headers));
         }
         if (from.isEmpty() == false) {
             bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_FROM, EmailParserModuleFactory.getModuleName(), from));
         }
+        if (to.isEmpty() == false) {
+            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_TO, EmailParserModuleFactory.getModuleName(), to));
+        }
+        if (subject.isEmpty() == false) {
+            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_SUBJECT, EmailParserModuleFactory.getModuleName(), subject));
+        }
+         
         if (dateL > 0) {
             bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_DATETIME_RCVD, EmailParserModuleFactory.getModuleName(), dateL));
             bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_DATETIME_SENT, EmailParserModuleFactory.getModuleName(), dateL));
@@ -389,25 +397,32 @@ public final class ThunderbirdMboxFileIngestModule implements FileIngestModule {
         if (body.isEmpty() == false) {
             bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_CONTENT_PLAIN, EmailParserModuleFactory.getModuleName(), body));
         }
+        
+        bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_MSG_ID, EmailParserModuleFactory.getModuleName(), ((id < 0L) ? NbBundle
+                .getMessage(this.getClass(), "ThunderbirdMboxFileIngestModule.notAvail") : String.valueOf(id))));
+        
+        if (localPath.isEmpty() == false) {
+            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_PATH, EmailParserModuleFactory.getModuleName(), localPath));
+        } else {
+            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_PATH, EmailParserModuleFactory.getModuleName(), "/foo/bar")); //NON-NLS
+        }
+        
+        if (cc.isEmpty() == false) {
+            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_CC, EmailParserModuleFactory.getModuleName(), cc));
+        }
+        if (bcc.isEmpty() == false) {
+            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_BCC, EmailParserModuleFactory.getModuleName(), bcc));
+        }
+        
         if (bodyHTML.isEmpty() == false) {
             bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_CONTENT_HTML, EmailParserModuleFactory.getModuleName(), bodyHTML));
         }
         if (rtf.isEmpty() == false) {
             bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_EMAIL_CONTENT_RTF, EmailParserModuleFactory.getModuleName(), rtf));
         }
-        bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_MSG_ID, EmailParserModuleFactory.getModuleName(), ((id < 0L) ? NbBundle
-                .getMessage(this.getClass(), "ThunderbirdMboxFileIngestModule.notAvail") : String.valueOf(id))));
-        if (subject.isEmpty() == false) {
-            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_SUBJECT, EmailParserModuleFactory.getModuleName(), subject));
-        }
-        if (localPath.isEmpty() == false) {
-            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_PATH, EmailParserModuleFactory.getModuleName(), localPath));
-        } else {
-            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_PATH, EmailParserModuleFactory.getModuleName(), "/foo/bar")); //NON-NLS
-        }
 
         try {
-            BlackboardArtifact bbart;
+            
             bbart = abstractFile.newArtifact(BlackboardArtifact.ARTIFACT_TYPE.TSK_EMAIL_MSG);
             bbart.addAttributes(bbattributes);
 
@@ -421,6 +436,8 @@ public final class ThunderbirdMboxFileIngestModule implements FileIngestModule {
         } catch (TskCoreException ex) {
             logger.log(Level.WARNING, null, ex);
         }
+
+        return bbart;
     }
 
     void postErrorMessage(String subj, String details) {

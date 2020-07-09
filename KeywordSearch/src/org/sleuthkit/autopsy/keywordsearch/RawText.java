@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -186,10 +186,6 @@ class RawText implements IndexedText {
         return 0;
     }
 
-    @Override
-    public LinkedHashMap<Integer, Integer> getHitsPages() {
-        return null;
-    }
 
     @Override
     public int getNumberPages() {
@@ -268,6 +264,7 @@ class RawText implements IndexedText {
         //not cached
         try {
             String indexedText = solrServer.getSolrContent(this.objectId, chunkId);
+            if (indexedText == null) indexedText = "";
             cachedString = EscapeUtil.escapeHtml(indexedText).trim();
             StringBuilder sb = new StringBuilder(cachedString.length() + 20);
             sb.append("<pre>").append(cachedString).append("</pre>"); //NON-NLS
@@ -283,6 +280,7 @@ class RawText implements IndexedText {
     private String getArtifactText() throws SolrServerException{
         try {
             String indexedText = KeywordSearch.getServer().getSolrContent(this.objectId, 1);
+            if (indexedText == null) indexedText = "";
             indexedText = EscapeUtil.escapeHtml(indexedText).trim();
             StringBuilder sb = new StringBuilder(indexedText.length() + 20);
             sb.append("<pre>").append(indexedText).append("</pre>"); //NON-NLS

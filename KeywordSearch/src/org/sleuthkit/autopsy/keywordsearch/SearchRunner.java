@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011 - 2014 Basis Technology Corp.
+ * Copyright 2011 - 2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,11 +19,13 @@
 package org.sleuthkit.autopsy.keywordsearch;
 
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.CancellationException;
@@ -43,7 +45,6 @@ import org.sleuthkit.autopsy.coreutils.MessageNotifyUtil;
 import org.sleuthkit.autopsy.coreutils.StopWatch;
 import org.sleuthkit.autopsy.ingest.IngestMessage;
 import org.sleuthkit.autopsy.ingest.IngestServices;
-import org.sleuthkit.datamodel.BlackboardArtifact;
 
 /**
  * Singleton keyword search manager: Launches search threads for each job and
@@ -62,7 +63,7 @@ public final class SearchRunner {
     private Map<Long, SearchJobInfo> jobs = new HashMap<>(); //guarded by "this"
 
     SearchRunner() {
-        ingester = Server.getIngester();
+        ingester = Ingester.getDefault();
         updateTimer = new Timer(NbBundle.getMessage(this.getClass(), "SearchRunner.updateTimer.title.text"), true); // run as a daemon
     }
 
@@ -128,6 +129,7 @@ public final class SearchRunner {
         }
 
         if (readyForFinalSearch) {
+            logger.log(Level.INFO, "Commiting search index before final search for search job {0}", job.getJobId()); //NON-NLS
             commit();
             doFinalSearch(job); //this will block until it's done
         }
@@ -186,7 +188,7 @@ public final class SearchRunner {
             final int numIndexedFiles = KeywordSearch.getServer().queryNumIndexedFiles();
             KeywordSearch.fireNumIndexedFilesChange(null, numIndexedFiles);
         } catch (NoOpenCoreException | KeywordSearchModuleException ex) {
-            logger.log(Level.WARNING, "Error executing Solr query to check number of indexed files: ", ex); //NON-NLS
+            logger.log(Level.SEVERE, "Error executing Solr query to check number of indexed files", ex); //NON-NLS
         }
     }
 
@@ -198,21 +200,27 @@ public final class SearchRunner {
      */
     private void doFinalSearch(SearchJobInfo job) {
         // Run one last search as there are probably some new files committed
-        logger.log(Level.INFO, "Running final search for jobid {0}", job.getJobId());         //NON-NLS
+        logger.log(Level.INFO, "Starting final search for search job {0}", job.getJobId());         //NON-NLS
         if (!job.getKeywordListNames().isEmpty()) {
             try {
                 // In case this job still has a worker running, wait for it to finish
+                logger.log(Level.INFO, "Checking for previous search for search job {0} before executing final search", job.getJobId()); //NON-NLS
                 job.waitForCurrentWorker();
 
                 SearchRunner.Searcher finalSearcher = new SearchRunner.Searcher(job, true);
                 job.setCurrentSearcher(finalSearcher); //save the ref
+                logger.log(Level.INFO, "Kicking off final search for search job {0}", job.getJobId()); //NON-NLS
                 finalSearcher.execute(); //start thread
 
                 // block until the search is complete
+                logger.log(Level.INFO, "Waiting for final search for search job {0}", job.getJobId()); //NON-NLS
                 finalSearcher.get();
+                logger.log(Level.INFO, "Final search for search job {0} completed", job.getJobId()); //NON-NLS
 
-            } catch (InterruptedException | ExecutionException ex) {
-                logger.log(Level.WARNING, "Job {1} final search thread failed: {2}", new Object[]{job.getJobId(), ex}); //NON-NLS
+            } catch (InterruptedException | CancellationException ex) {
+                logger.log(Level.INFO, "Final search for search job {0} interrupted or cancelled", job.getJobId()); //NON-NLS
+            } catch (ExecutionException ex) {
+                logger.log(Level.SEVERE, String.format("Final search for search job %d failed", job.getJobId()), ex); //NON-NLS
             }
         }
     }
@@ -241,6 +249,7 @@ public final class SearchRunner {
                     SearchJobInfo job = j.getValue();
                     // If no lists or the worker is already running then skip it
                     if (!job.getKeywordListNames().isEmpty() && !job.isWorkerRunning()) {
+                        logger.log(Level.INFO, "Executing periodic search for search job {0}", job.getJobId());
                         Searcher searcher = new Searcher(job);
                         job.setCurrentSearcher(searcher); //save the ref
                         searcher.execute(); //start thread
@@ -262,12 +271,14 @@ public final class SearchRunner {
         // mutable state:
         private volatile boolean workerRunning;
         private List<String> keywordListNames; //guarded by SearchJobInfo.this
-        private Map<Keyword, List<Long>> currentResults; //guarded by SearchJobInfo.this
+
+        // Map of keyword to the object ids that contain a hit
+        private Map<Keyword, Set<Long>> currentResults; //guarded by SearchJobInfo.this
         private SearchRunner.Searcher currentSearcher;
         private AtomicLong moduleReferenceCount = new AtomicLong(0);
         private final Object finalSearchLock = new Object(); //used for a condition wait
 
-        public SearchJobInfo(long jobId, long dataSourceId, List<String> keywordListNames) {
+        private SearchJobInfo(long jobId, long dataSourceId, List<String> keywordListNames) {
             this.jobId = jobId;
             this.dataSourceId = dataSourceId;
             this.keywordListNames = new ArrayList<>(keywordListNames);
@@ -276,53 +287,53 @@ public final class SearchRunner {
             currentSearcher = null;
         }
 
-        public long getJobId() {
+        private long getJobId() {
             return jobId;
         }
 
-        public long getDataSourceId() {
+        private long getDataSourceId() {
             return dataSourceId;
         }
 
-        public synchronized List<String> getKeywordListNames() {
+        private synchronized List<String> getKeywordListNames() {
             return new ArrayList<>(keywordListNames);
         }
 
-        public synchronized void addKeywordListName(String keywordListName) {
+        private synchronized void addKeywordListName(String keywordListName) {
             if (!keywordListNames.contains(keywordListName)) {
                 keywordListNames.add(keywordListName);
             }
         }
 
-        public synchronized List<Long> currentKeywordResults(Keyword k) {
+        private synchronized Set<Long> currentKeywordResults(Keyword k) {
             return currentResults.get(k);
         }
 
-        public synchronized void addKeywordResults(Keyword k, List<Long> resultsIDs) {
+        private synchronized void addKeywordResults(Keyword k, Set<Long> resultsIDs) {
             currentResults.put(k, resultsIDs);
         }
 
-        public boolean isWorkerRunning() {
+        private boolean isWorkerRunning() {
             return workerRunning;
         }
 
-        public void setWorkerRunning(boolean flag) {
+        private void setWorkerRunning(boolean flag) {
             workerRunning = flag;
         }
 
-        public synchronized SearchRunner.Searcher getCurrentSearcher() {
+        private synchronized SearchRunner.Searcher getCurrentSearcher() {
             return currentSearcher;
         }
 
-        public synchronized void setCurrentSearcher(SearchRunner.Searcher searchRunner) {
+        private synchronized void setCurrentSearcher(SearchRunner.Searcher searchRunner) {
             currentSearcher = searchRunner;
         }
 
-        public void incrementModuleReferenceCount() {
+        private void incrementModuleReferenceCount() {
             moduleReferenceCount.incrementAndGet();
         }
 
-        public long decrementModuleReferenceCount() {
+        private long decrementModuleReferenceCount() {
             return moduleReferenceCount.decrementAndGet();
         }
 
@@ -331,10 +342,12 @@ public final class SearchRunner {
          *
          * @throws InterruptedException
          */
-        public void waitForCurrentWorker() throws InterruptedException {
+        private void waitForCurrentWorker() throws InterruptedException {
             synchronized (finalSearchLock) {
                 while (workerRunning) {
+                    logger.log(Level.INFO, "Waiting for previous worker to finish"); //NON-NLS
                     finalSearchLock.wait(); //wait() releases the lock
+                    logger.log(Level.INFO, "Notified previous worker finished"); //NON-NLS
                 }
             }
         }
@@ -342,8 +355,9 @@ public final class SearchRunner {
         /**
          * Unset workerRunning and wake up thread(s) waiting on finalSearchLock
          */
-        public void searchNotify() {
+        private void searchNotify() {
             synchronized (finalSearchLock) {
+                logger.log(Level.INFO, "Notifying after finishing search"); //NON-NLS
                 workerRunning = false;
                 finalSearchLock.notify();
             }
@@ -365,7 +379,7 @@ public final class SearchRunner {
         private List<Keyword> keywords; //keywords to search
         private List<String> keywordListNames; // lists currently being searched
         private List<KeywordList> keywordLists;
-        private Map<String, KeywordList> keywordToList; //keyword to list name mapping
+        private Map<Keyword, KeywordList> keywordToList; //keyword to list name mapping
         private AggregateProgressHandle progressGroup;
         private final Logger logger = Logger.getLogger(SearchRunner.Searcher.class.getName());
         private boolean finalRun = false;
@@ -420,14 +434,13 @@ public final class SearchRunner {
 
                 int keywordsSearched = 0;
 
-                for (Keyword keywordQuery : keywords) {
+                for (Keyword keyword : keywords) {
                     if (this.isCancelled()) {
-                        logger.log(Level.INFO, "Cancel detected, bailing before new keyword processed: {0}", keywordQuery.getSearchTerm()); //NON-NLS
+                        logger.log(Level.INFO, "Cancel detected, bailing before new keyword processed: {0}", keyword.getSearchTerm()); //NON-NLS
                         return null;
                     }
 
-                    final String queryStr = keywordQuery.getSearchTerm();
-                    final KeywordList list = keywordToList.get(queryStr);
+                    final KeywordList keywordList = keywordToList.get(keyword);
 
                     //new subProgress will be active after the initial query
                     //when we know number of hits to start() with
@@ -435,15 +448,7 @@ public final class SearchRunner {
                         subProgresses[keywordsSearched - 1].finish();
                     }
 
-                    KeywordSearchQuery keywordSearchQuery = null;
-
-                    boolean isRegex = !keywordQuery.searchTermIsLiteral();
-                    if (isRegex) {
-                        keywordSearchQuery = new TermsComponentQuery(list, keywordQuery);
-                    } else {
-                        keywordSearchQuery = new LuceneQuery(list, keywordQuery);
-                        keywordSearchQuery.escape();
-                    }
+                    KeywordSearchQuery keywordSearchQuery = KeywordSearchUtil.getQueryForKeyword(keyword, keywordList);
 
                     // Filtering
                     //limit search to currently ingested data sources
@@ -457,39 +462,37 @@ public final class SearchRunner {
                     try {
                         queryResults = keywordSearchQuery.performQuery();
                     } catch (KeywordSearchModuleException | NoOpenCoreException ex) {
-                        logger.log(Level.SEVERE, "Error performing query: " + keywordQuery.getSearchTerm(), ex); //NON-NLS
-                        MessageNotifyUtil.Notify.error(Bundle.SearchRunner_query_exception_msg() + keywordQuery.getSearchTerm(), ex.getCause().getMessage());
+                        logger.log(Level.SEVERE, "Error performing query: " + keyword.getSearchTerm(), ex); //NON-NLS
+                        MessageNotifyUtil.Notify.error(Bundle.SearchRunner_query_exception_msg() + keyword.getSearchTerm(), ex.getCause().getMessage());
                         //no reason to continue with next query if recovery failed
                         //or wait for recovery to kick in and run again later
                         //likely case has closed and threads are being interrupted
                         return null;
                     } catch (CancellationException e) {
-                        logger.log(Level.INFO, "Cancel detected, bailing during keyword query: {0}", keywordQuery.getSearchTerm()); //NON-NLS
+                        logger.log(Level.INFO, "Cancel detected, bailing during keyword query: {0}", keyword.getSearchTerm()); //NON-NLS
                         return null;
                     }
 
-                    // calculate new results by substracting results already obtained in this ingest
-                    // this creates a map of each keyword to the list of unique files that have that hit. 
+                    // Reduce the results of the query to only those hits we
+                    // have not already seen. 
                     QueryResults newResults = filterResults(queryResults);
 
                     if (!newResults.getKeywords().isEmpty()) {
 
                         // Write results to BB
-                        //new artifacts created, to report to listeners
-                        Collection<BlackboardArtifact> newArtifacts = new ArrayList<>();
-
+                        
                         //scale progress bar more more granular, per result sub-progress, within per keyword
                         int totalUnits = newResults.getKeywords().size();
                         subProgresses[keywordsSearched].start(totalUnits);
                         int unitProgress = 0;
-                        String queryDisplayStr = keywordQuery.getSearchTerm();
+                        String queryDisplayStr = keyword.getSearchTerm();
                         if (queryDisplayStr.length() > 50) {
                             queryDisplayStr = queryDisplayStr.substring(0, 49) + "...";
                         }
-                        subProgresses[keywordsSearched].progress(list.getName() + ": " + queryDisplayStr, unitProgress);
+                        subProgresses[keywordsSearched].progress(keywordList.getName() + ": " + queryDisplayStr, unitProgress);
 
                         // Create blackboard artifacts                
-                        newArtifacts = newResults.writeAllHitsToBlackBoard(null, subProgresses[keywordsSearched], this, list.getIngestMessages());
+                        newResults.process(null, subProgresses[keywordsSearched], this, keywordList.getIngestMessages());
 
                     } //if has results
 
@@ -507,8 +510,7 @@ public final class SearchRunner {
                 try {
                     finalizeSearcher();
                     stopWatch.stop();
-
-                    logger.log(Level.INFO, "Searcher took to run: {0} secs.", stopWatch.getElapsedTimeSecs()); //NON-NLS
+                    logger.log(Level.INFO, "Searcher took {0} secs to run (final = {1})", new Object[]{stopWatch.getElapsedTimeSecs(), this.finalRun}); //NON-NLS
                 } finally {
                     // In case a thread is waiting on this worker to be done
                     job.searchNotify();
@@ -522,7 +524,9 @@ public final class SearchRunner {
         protected void done() {
             // call get to see if there were any errors
             try {
+                logger.log(Level.INFO, "Searcher calling get() on itself in done()"); //NON-NLS             
                 get();
+                logger.log(Level.INFO, "Searcher finished calling get() on itself in done()"); //NON-NLS             
             } catch (InterruptedException | ExecutionException e) {
                 logger.log(Level.SEVERE, "Error performing keyword search: " + e.getMessage()); //NON-NLS
                 services.postMessage(IngestMessage.createErrorMessage(KeywordSearchModuleFactory.getModuleName(),
@@ -548,7 +552,7 @@ public final class SearchRunner {
                 keywordLists.add(list);
                 for (Keyword k : list.getKeywords()) {
                     keywords.add(k);
-                    keywordToList.put(k.getSearchTerm(), list);
+                    keywordToList.put(k, list);
                 }
             }
         }
@@ -567,40 +571,74 @@ public final class SearchRunner {
             });
         }
 
-        //calculate new results but substracting results already obtained in this ingest
-        //update currentResults map with the new results
+        /**
+         * This method filters out all of the hits found in earlier periodic
+         * searches and returns only the results found by the most recent
+         * search.
+         *
+         * This method will only return hits for objects for which we haven't
+         * previously seen a hit for the keyword.
+         *
+         * @param queryResult The results returned by a keyword search.
+         *
+         * @return A unique set of hits found by the most recent search for
+         *         objects that have not previously had a hit. The hits will be
+         *         for the lowest numbered chunk associated with the object.
+         *
+         */
         private QueryResults filterResults(QueryResults queryResult) {
 
-            QueryResults newResults = new QueryResults(queryResult.getQuery(), queryResult.getKeywordList());
+            // Create a new (empty) QueryResults object to hold the most recently
+            // found hits.
+            QueryResults newResults = new QueryResults(queryResult.getQuery());
 
+            // For each keyword represented in the results.
             for (Keyword keyword : queryResult.getKeywords()) {
+                // These are all of the hits across all objects for the most recent search.
+                // This may well include duplicates of hits we've seen in earlier periodic searches.
                 List<KeywordHit> queryTermResults = queryResult.getResults(keyword);
 
-                //translate to list of IDs that we keep track of
-                List<Long> queryTermResultsIDs = new ArrayList<>();
-                for (KeywordHit ch : queryTermResults) {
-                    queryTermResultsIDs.add(ch.getSolrObjectId());
+                // Sort the hits for this keyword so that we are always 
+                // guaranteed to return the hit for the lowest chunk.
+                Collections.sort(queryTermResults);
+
+                // This will be used to build up the hits we haven't seen before
+                // for this keyword.
+                List<KeywordHit> newUniqueHits = new ArrayList<>();
+
+                // Get the set of object ids seen in the past by this searcher
+                // for the given keyword.
+                Set<Long> curTermResults = job.currentKeywordResults(keyword);
+                if (curTermResults == null) {
+                    // We create a new empty set if we haven't seen results for
+                    // this keyword before.
+                    curTermResults = new HashSet<>();
                 }
 
-                List<Long> curTermResults = job.currentKeywordResults(keyword);
-                if (curTermResults == null) {
-                    job.addKeywordResults(keyword, queryTermResultsIDs);
-                    newResults.addResult(keyword, queryTermResults);
-                } else {
-                    //some AbstractFile hits already exist for this keyword
-                    for (KeywordHit res : queryTermResults) {
-                        if (!curTermResults.contains(res.getSolrObjectId())) {
-                            //add to new results
-                            List<KeywordHit> newResultsFs = newResults.getResults(keyword);
-                            if (newResultsFs == null) {
-                                newResultsFs = new ArrayList<>();
-                                newResults.addResult(keyword, newResultsFs);
-                            }
-                            newResultsFs.add(res);
-                            curTermResults.add(res.getSolrObjectId());
-                        }
+                // For each hit for this keyword.
+                for (KeywordHit hit : queryTermResults) {
+                    if (curTermResults.contains(hit.getSolrObjectId())) {
+                        // Skip the hit if we've already seen a hit for
+                        // this keyword in the object.
+                        continue;
                     }
+
+                    // We haven't seen the hit before so add it to list of new
+                    // unique hits.
+                    newUniqueHits.add(hit);
+
+                    // Add the object id to the results we've seen for this
+                    // keyword.
+                    curTermResults.add(hit.getSolrObjectId());
                 }
+
+                // Update the job with the list of objects for which we have
+                // seen hits for the current keyword.
+                job.addKeywordResults(keyword, curTermResults);
+
+                // Add the new hits for the current keyword into the results
+                // to be returned.
+                newResults.addResult(keyword, newUniqueHits);
             }
 
             return newResults;

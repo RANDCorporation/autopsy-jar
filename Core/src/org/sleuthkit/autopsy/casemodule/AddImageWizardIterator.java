@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,9 @@ import javax.swing.JComponent;
 import javax.swing.event.ChangeListener;
 import org.openide.WizardDescriptor;
 import org.openide.util.NbBundle;
+import org.sleuthkit.autopsy.ingest.IngestProfiles;
+import org.sleuthkit.autopsy.ingest.runIngestModuleWizard.IngestProfileSelectionWizardPanel;
+import org.sleuthkit.autopsy.ingest.runIngestModuleWizard.ShortcutWizardDescriptorPanel;
 
 /**
  * The iterator class for the "Add Image" wizard panel. This class is used to
@@ -34,8 +37,11 @@ import org.openide.util.NbBundle;
 class AddImageWizardIterator implements WizardDescriptor.Iterator<WizardDescriptor> {
 
     private int index = 0;
-    private List<WizardDescriptor.Panel<WizardDescriptor>> panels;
-    private AddImageAction action;
+    private List<ShortcutWizardDescriptorPanel> panels;
+    private final AddImageAction action;
+    private int progressPanelIndex;
+    private int dsPanelIndex;
+    private final static String PROP_LASTPROFILE_NAME = "AIW_LASTPROFILE_NAME"; //NON-NLS
 
     AddImageWizardIterator(AddImageAction action) {
         this.action = action;
@@ -45,19 +51,24 @@ class AddImageWizardIterator implements WizardDescriptor.Iterator<WizardDescript
      * Initialize panels representing individual wizard's steps and sets various
      * properties for them influencing wizard appearance.
      */
-    private List<WizardDescriptor.Panel<WizardDescriptor>> getPanels() {
+    private List<ShortcutWizardDescriptorPanel> getPanels() {
         if (panels == null) {
-            panels = new ArrayList<WizardDescriptor.Panel<WizardDescriptor>>();
+            panels = new ArrayList<>();
+            AddImageWizardSelectDspPanel dspSelection = new AddImageWizardSelectDspPanel();
+            panels.add(dspSelection);
+            AddImageWizardAddingProgressPanel progressPanel = new AddImageWizardAddingProgressPanel(action);
 
-            AddImageWizardAddingProgressPanel progressPanel = new AddImageWizardAddingProgressPanel();
-
-            AddImageWizardChooseDataSourcePanel dsPanel = new AddImageWizardChooseDataSourcePanel(progressPanel);
-            AddImageWizardIngestConfigPanel ingestConfigPanel = new AddImageWizardIngestConfigPanel(dsPanel, action, progressPanel);
-
+            AddImageWizardDataSourceSettingsPanel dsPanel = new AddImageWizardDataSourceSettingsPanel();
+            AddImageWizardIngestConfigPanel ingestConfigPanel = new AddImageWizardIngestConfigPanel(progressPanel);
             panels.add(dsPanel);
+            List<IngestProfiles.IngestProfile> profiles = IngestProfiles.getIngestProfiles();
+            if (!profiles.isEmpty()) {
+                panels.add(new IngestProfileSelectionWizardPanel(AddImageWizardIngestConfigPanel.class.getCanonicalName(), getPropLastprofileName()));
+            }
             panels.add(ingestConfigPanel);
             panels.add(progressPanel);
-
+            progressPanelIndex = panels.indexOf(progressPanel);  //Doing programatically because number of panels is variable
+            dsPanelIndex = panels.indexOf(dsPanel);
             String[] steps = new String[panels.size()];
             for (int i = 0; i < panels.size(); i++) {
                 Component c = panels.get(i).getComponent();
@@ -66,7 +77,7 @@ class AddImageWizardIterator implements WizardDescriptor.Iterator<WizardDescript
                 if (c instanceof JComponent) { // assume Swing components
                     JComponent jc = (JComponent) c;
                     // Sets step number of a component
-                    jc.putClientProperty("WizardPanel_contentSelectedIndex", new Integer(i));
+                    jc.putClientProperty("WizardPanel_contentSelectedIndex", i);
                     // Sets steps names for a panel
                     jc.putClientProperty("WizardPanel_contentData", steps);
                     // Turn on subtitle creation on each step
@@ -92,12 +103,29 @@ class AddImageWizardIterator implements WizardDescriptor.Iterator<WizardDescript
     }
 
     /**
+     * Gets the name of the property which stores the name of the last profile
+     * used by the Add Image Wizard.
+     *
+     * @return the PROP_LASTPROFILE_NAME
+     */
+    static String getPropLastprofileName() {
+        return PROP_LASTPROFILE_NAME;
+    }
+
+    /**
+     * @return the PROP_LASTPROFILE_NAME
+     */
+    static String getPROP_LASTPROFILE_NAME() {
+        return PROP_LASTPROFILE_NAME;
+    }
+
+    /**
      * Gets the current panel.
      *
      * @return panel the current panel
      */
     @Override
-    public WizardDescriptor.Panel<WizardDescriptor> current() {
+    public ShortcutWizardDescriptorPanel current() {
         if (panels != null) {
             return panels.get(index);
         } else {
@@ -132,9 +160,9 @@ class AddImageWizardIterator implements WizardDescriptor.Iterator<WizardDescript
      * @return boolean true if it has previous panel, false if not
      */
     @Override
-    // disable the previous button on all panels
+    // disable the previous button on all panels except the data source panel
     public boolean hasPrevious() {
-        return false;
+        return (index == dsPanelIndex); //Users should be able to back up to select a different DSP
     }
 
     /**
@@ -146,7 +174,20 @@ class AddImageWizardIterator implements WizardDescriptor.Iterator<WizardDescript
         if (!hasNext()) {
             throw new NoSuchElementException();
         }
+        // Start processing the data source by handing it off to the selected DSP, 
+        // so it gets going in the background while the user is still picking the Ingest modules    
+        // This will occur when the next button is clicked on the panel where you have chosen your data to process
+        if (index == dsPanelIndex) {
+            ((AddImageWizardAddingProgressPanel) panels.get(progressPanelIndex)).
+                    startDataSourceProcessing(((AddImageWizardDataSourceSettingsPanel) panels.get(dsPanelIndex)).getComponent().getCurrentDSProcessor());
+        }
+        boolean panelEnablesSkipping = current().panelEnablesSkipping();
+        boolean skipNextPanel = current().skipNextPanel();
         index++;
+        if (panelEnablesSkipping && skipNextPanel) {
+            current().processThisPanelBeforeSkipped();
+            nextPanel();
+        }
     }
 
     /**
@@ -158,7 +199,7 @@ class AddImageWizardIterator implements WizardDescriptor.Iterator<WizardDescript
         if (!hasPrevious()) {
             throw new NoSuchElementException();
         }
-        if (index == 2) {
+        if (index == progressPanelIndex) {
             index--;
         }
         index--;

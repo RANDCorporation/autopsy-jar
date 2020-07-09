@@ -24,6 +24,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -251,7 +253,7 @@ public class HashsetHits implements AutopsyVisitableItem {
         protected void addNotify() {
             IngestManager.getInstance().addIngestJobEventListener(pcl);
             IngestManager.getInstance().addIngestModuleEventListener(pcl);
-            Case.addPropertyChangeListener(pcl);
+            Case.addEventTypeSubscriber(EnumSet.of(Case.Events.CURRENT_CASE), pcl);
             hashsetResults.update();
             hashsetResults.addObserver(this);
         }
@@ -260,7 +262,7 @@ public class HashsetHits implements AutopsyVisitableItem {
         protected void removeNotify() {
             IngestManager.getInstance().removeIngestJobEventListener(pcl);
             IngestManager.getInstance().removeIngestModuleEventListener(pcl);
-            Case.removePropertyChangeListener(pcl);
+            Case.removeEventTypeSubscriber(EnumSet.of(Case.Events.CURRENT_CASE), pcl);
             hashsetResults.deleteObserver(this);
         }
 
@@ -352,7 +354,8 @@ public class HashsetHits implements AutopsyVisitableItem {
     private class HitFactory extends ChildFactory.Detachable<Long> implements Observer {
 
         private String hashsetName;
-
+        private Map<Long, BlackboardArtifact> artifactHits = new HashMap<>();
+ 
         private HitFactory(String hashsetName) {
             super();
             this.hashsetName = hashsetName;
@@ -370,23 +373,29 @@ public class HashsetHits implements AutopsyVisitableItem {
 
         @Override
         protected boolean createKeys(List<Long> list) {
-            list.addAll(hashsetResults.getArtifactIds(hashsetName));
+ 
+            if (skCase == null) {
+               return true;
+            }
+            
+            hashsetResults.getArtifactIds(hashsetName).forEach((id) -> {
+                try {
+                    if (!artifactHits.containsKey(id)) {
+                        BlackboardArtifact art = skCase.getBlackboardArtifact(id);
+                        artifactHits.put(id, art);
+                    }
+                    list.add(id);
+                } catch (TskException ex) {
+                    logger.log(Level.SEVERE, "TSK Exception occurred", ex); //NON-NLS
+                }
+            });
             return true;
         }
 
         @Override
-        protected Node createNodeForKey(Long id) {
-            if (skCase == null) {
-                return null;
-            }
-
-            try {
-                BlackboardArtifact art = skCase.getBlackboardArtifact(id);
-                return new BlackboardArtifactNode(art);
-            } catch (TskException ex) {
-                logger.log(Level.WARNING, "TSK Exception occurred", ex); //NON-NLS
-            }
-            return null;
+        protected Node createNodeForKey(Long id) {     
+            BlackboardArtifact art = artifactHits.get(id);
+            return (null == art) ? null : new BlackboardArtifactNode(art);
         }
 
         @Override

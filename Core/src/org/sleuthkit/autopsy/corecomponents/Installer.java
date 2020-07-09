@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,6 @@
 package org.sleuthkit.autopsy.corecomponents;
 
 import java.awt.Insets;
-import java.io.File;
-import java.util.Collection;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.logging.Level;
@@ -28,15 +26,9 @@ import javax.swing.BorderFactory;
 import javax.swing.UIManager;
 import javax.swing.UIManager.LookAndFeelInfo;
 import javax.swing.UnsupportedLookAndFeelException;
-import org.netbeans.spi.sendopts.OptionProcessor;
 import org.netbeans.swing.tabcontrol.plaf.DefaultTabbedContainerUI;
 import org.openide.modules.ModuleInstall;
-import org.openide.util.Lookup;
 import org.openide.windows.WindowManager;
-import org.sleuthkit.autopsy.casemodule.Case;
-import org.sleuthkit.autopsy.casemodule.CaseActionException;
-import org.sleuthkit.autopsy.casemodule.CaseMetadata;
-import org.sleuthkit.autopsy.casemodule.OpenFromArguments;
 import org.sleuthkit.autopsy.casemodule.StartupWindowProvider;
 import org.sleuthkit.autopsy.coreutils.Logger;
 
@@ -50,7 +42,7 @@ public class Installer extends ModuleInstall {
     private static Installer instance;
 
     public synchronized static Installer getDefault() {
-        if (instance == null) {
+        if (null == instance) {
             instance = new Installer();
         }
         return instance;
@@ -63,63 +55,18 @@ public class Installer extends ModuleInstall {
     @Override
     public void restored() {
         super.restored();
-
         setLookAndFeel();
         UIManager.put("ViewTabDisplayerUI", "org.sleuthkit.autopsy.corecomponents.NoTabsTabDisplayerUI");
         UIManager.put(DefaultTabbedContainerUI.KEY_VIEW_CONTENT_BORDER, BorderFactory.createEmptyBorder());
         UIManager.put("TabbedPane.contentBorderInsets", new Insets(0, 0, 0, 0));
-
-        /*
-         * Open the case if a case metadata file was double-clicked. This only
-         * works if the user has associated files with ".aut" extensions with
-         * Autopsy.
-         */
         WindowManager.getDefault().invokeWhenUIReady(() -> {
-            Collection<? extends OptionProcessor> processors = Lookup.getDefault().lookupAll(OptionProcessor.class);
-            for (OptionProcessor processor : processors) {
-                if (processor instanceof OpenFromArguments) {
-                    OpenFromArguments argsProcessor = (OpenFromArguments) processor;
-                    final String caseFile = argsProcessor.getDefaultArg();
-                    if (caseFile != null && !caseFile.equals("") && caseFile.endsWith(CaseMetadata.getFileExtension()) && new File(caseFile).exists()) { //NON-NLS
-                        new Thread(() -> {
-                            try {
-                                Case.open(caseFile);
-                            } catch (Exception ex) {
-                                logger.log(Level.SEVERE, String.format("Error opening case with metadata file path %s", caseFile), ex); //NON-NLS
-                            }
-                        }).start();
-                        return;
-                    }
-                }
-            }
             StartupWindowProvider.getInstance().open();
         });
-
     }
 
     @Override
     public void uninstalled() {
         super.uninstalled();
-    }
-
-    @Override
-    public void close() {
-        new Thread(() -> {
-            String caseDirName = null;
-            try {
-                if (Case.isCaseOpen()) {
-                    Case currentCase = Case.getCurrentCase();
-                    caseDirName = currentCase.getCaseDirectory();
-                    currentCase.closeCase();
-                }
-            } catch (CaseActionException ex) {
-                logger.log(Level.SEVERE, String.format("Error closing case with case directory %s", (null != caseDirName ? caseDirName : "?")), ex); //NON-NLS
-            } catch (IllegalStateException ignored) {
-                /*
-                 * No current case. Case.isCaseOpen is not reliable. 
-                 */
-            }
-        }).start();
     }
 
     private void setLookAndFeel() {

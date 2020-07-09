@@ -40,13 +40,13 @@ final class GetRootDirectoryVisitor extends GetFilesContentVisitor {
 
     @Override
     public Collection<AbstractFile> visit(VirtualDirectory ld) {
-        //case when we hit a layout directoryor local file container, not under a real FS
+        //case when we hit a layout directory or local file container, not under a real FS
         //or when root virt dir is scheduled
         Collection<AbstractFile> ret = new ArrayList<>();
         ret.add(ld);
         return ret;
     }
-
+    
     @Override
     public Collection<AbstractFile> visit(LocalDirectory ld) {
         //case when we hit a local directory

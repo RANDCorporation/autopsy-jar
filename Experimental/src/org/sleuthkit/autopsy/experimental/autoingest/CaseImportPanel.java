@@ -39,7 +39,6 @@ import org.sleuthkit.datamodel.SleuthkitCase;
 import org.sleuthkit.datamodel.TskCoreException;
 import java.util.logging.Level;
 import org.sleuthkit.autopsy.experimental.configuration.AutoIngestUserPreferences;
-import static org.sleuthkit.autopsy.experimental.configuration.AutoIngestUserPreferences.SelectedMode.AUTOMATED;
 
 /**
  * This panel shows up in a tab pane next to the copy files panel for the
@@ -108,7 +107,7 @@ public class CaseImportPanel extends javax.swing.JPanel implements ImportDoneCal
         if (!UserPreferences.getIsMultiUserModeEnabled()) {
             tbOops.setText(MULTI_USER_SETTINGS_MUST_BE_ENABLED);
             return;
-        } else if (RuntimeProperties.coreComponentsAreActive()) {
+        } else if (RuntimeProperties.runningWithGUI()) {
             tbOops.setText(AIM_MUST_BE_ENABLED);
             return;
         } else {
@@ -673,8 +672,7 @@ public class CaseImportPanel extends javax.swing.JPanel implements ImportDoneCal
      */
     private void enableStartButton() {
         if (UserPreferences.getIsMultiUserModeEnabled()
-                && AutoIngestUserPreferences.getJoinAutoModeCluster()
-                && (! RuntimeProperties.coreComponentsAreActive())
+                && (! RuntimeProperties.runningWithGUI())
                 && !tbCaseSource.getText().isEmpty()
                 && !tbCaseDestination.getText().isEmpty()
                 && canTalkToDb == true

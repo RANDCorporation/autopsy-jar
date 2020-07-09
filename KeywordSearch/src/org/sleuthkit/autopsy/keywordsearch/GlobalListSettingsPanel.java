@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@ package org.sleuthkit.autopsy.keywordsearch;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.beans.PropertyChangeListener;
+import java.util.ArrayList;
 import java.util.List;
 import javax.swing.JOptionPane;
 import org.openide.util.NbBundle;
@@ -30,10 +31,12 @@ final class GlobalListSettingsPanel extends javax.swing.JPanel implements Option
 
     private static final long serialVersionUID = 1L;
 
-    private final GlobalListsManagementPanel listsManagementPanel = new GlobalListsManagementPanel(this);
-    private final GlobalEditListPanel editListPanel = new GlobalEditListPanel();
+    private GlobalListsManagementPanel listsManagementPanel;
+    private GlobalEditListPanel editListPanel;
 
     GlobalListSettingsPanel() {
+        if (listsManagementPanel == null) listsManagementPanel = new GlobalListsManagementPanel(this);
+        if (editListPanel == null) editListPanel = new GlobalEditListPanel();
         initComponents();
         customizeComponents();
         setName(org.openide.util.NbBundle.getMessage(DropdownToolbar.class, "ListBundleConfig"));
@@ -41,68 +44,30 @@ final class GlobalListSettingsPanel extends javax.swing.JPanel implements Option
 
     private void customizeComponents() {
         listsManagementPanel.addListSelectionListener(editListPanel);
-        editListPanel.addDeleteButtonActionPerformed(new ActionListener() {
+        listsManagementPanel.addDeleteButtonActionPerformed(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
                 if (KeywordSearchUtil.displayConfirmDialog(NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.title"), NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.body"), KeywordSearchUtil.DIALOG_MESSAGE_TYPE.WARN)) {
-                    String toDelete = editListPanel.getCurrentKeywordList().getName();
-                    editListPanel.setCurrentKeywordList(null);
-                    editListPanel.setButtonStates();
-                    XmlKeywordSearchList deleter = XmlKeywordSearchList.getCurrent();
-                    deleter.deleteList(toDelete);
+                    deleteAction();
                     listsManagementPanel.resync();
                 }
             }
         });
 
-        editListPanel.addSaveButtonActionPerformed(new ActionListener() {
+        listsManagementPanel.addRenameButtonActionPerformed(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
-                final String FEATURE_NAME = NbBundle.getMessage(this.getClass(),
-                        "KeywordSearchGlobalListSettingsPanel.component.featureName.text");
-                KeywordList currentKeywordList = editListPanel.getCurrentKeywordList();
-
-                List<Keyword> keywords = currentKeywordList.getKeywords();
-                if (keywords.isEmpty()) {
-                    KeywordSearchUtil.displayDialog(FEATURE_NAME, NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.keywordListEmptyErr"),
-                            KeywordSearchUtil.DIALOG_MESSAGE_TYPE.INFO);
-                    return;
+                if (copyAction()) {
+                    deleteAction();
+                    listsManagementPanel.resync();
                 }
+            }
+        });
 
-                String listName = (String) JOptionPane.showInputDialog(
-                        null,
-                        NbBundle.getMessage(this.getClass(), "KeywordSearch.newKwListTitle"),
-                        FEATURE_NAME,
-                        JOptionPane.PLAIN_MESSAGE,
-                        null,
-                        null,
-                        currentKeywordList.getName());
-                if (listName == null || listName.trim().equals("")) {
-                    return;
-                }
-
-                XmlKeywordSearchList writer = XmlKeywordSearchList.getCurrent();
-                if (writer.listExists(listName) && writer.getList(listName).isEditable()) {
-                    KeywordSearchUtil.displayDialog(FEATURE_NAME, NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.noOwDefaultMsg"), KeywordSearchUtil.DIALOG_MESSAGE_TYPE.WARN);
-                    return;
-                }
-                boolean shouldAdd = false;
-                if (writer.listExists(listName)) {
-                    boolean replace = KeywordSearchUtil.displayConfirmDialog(FEATURE_NAME, NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.kwListExistMsg", listName),
-                            KeywordSearchUtil.DIALOG_MESSAGE_TYPE.WARN);
-                    if (replace) {
-                        shouldAdd = true;
-                    }
-
-                } else {
-                    shouldAdd = true;
-                }
-
-                if (shouldAdd) {
-                    writer.addList(listName, keywords);
-                    KeywordSearchUtil.displayDialog(FEATURE_NAME, NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.kwListSavedMsg", listName), KeywordSearchUtil.DIALOG_MESSAGE_TYPE.INFO);
-                }
-
+        listsManagementPanel.addCopyButtonActionPerformed(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                copyAction();
                 listsManagementPanel.resync();
             }
         });
@@ -113,14 +78,99 @@ final class GlobalListSettingsPanel extends javax.swing.JPanel implements Option
         mainSplitPane.repaint();
     }
 
+    /**
+     * Delete the specified Keyword List
+     *
+     * @param toDelete - the list to delete
+     */
+    private void deleteAction() {
+        listsManagementPanel.deleteSelected();
+        editListPanel.setCurrentKeywordList(null);
+        editListPanel.setButtonStates();
+        listsManagementPanel.setButtonStates();
+    }
+
+    /**
+     * Duplicates the selected keyword list, returns whether or not the keyword
+     * list was duplicated.
+     *
+     * @return true if the list was copied false if it was not
+     */
+    private boolean copyAction() {
+        final String FEATURE_NAME = NbBundle.getMessage(this.getClass(),
+                "KeywordSearchGlobalListSettingsPanel.component.featureName.text");
+        KeywordList currentKeywordList = editListPanel.getCurrentKeywordList();
+
+        List<Keyword> keywords = new ArrayList<>();
+        keywords.addAll(currentKeywordList.getKeywords());
+
+        String listName = (String) JOptionPane.showInputDialog(
+                null,
+                NbBundle.getMessage(this.getClass(), "KeywordSearch.newKwListTitle"),
+                FEATURE_NAME,
+                JOptionPane.PLAIN_MESSAGE,
+                null,
+                null,
+                currentKeywordList.getName());
+
+        if (listName == null) {
+            return false;
+        }
+        //remove trailing and leading spaces so lists can't have visually identical names
+        listName = listName.trim();
+        //if the name is empty or unchanged return without changing anything
+        if (listName.equals("") || listName.equals(currentKeywordList.getName())) {
+            return false;
+        }
+        XmlKeywordSearchList writer = XmlKeywordSearchList.getCurrent();
+        if (writer.listExists(listName) && writer.getList(listName).isEditable()) {
+            KeywordSearchUtil.displayDialog(FEATURE_NAME, NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.noOwDefaultMsg"), KeywordSearchUtil.DIALOG_MESSAGE_TYPE.WARN);
+            return false;
+        }
+        if (writer.listExists(listName)) {
+            if (!KeywordSearchUtil.displayConfirmDialog(FEATURE_NAME, NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.kwListExistMsg", listName),
+                    KeywordSearchUtil.DIALOG_MESSAGE_TYPE.WARN)) {
+                return false;
+            }
+        }
+        writer.addList(listName, keywords);
+        KeywordSearchUtil.displayDialog(FEATURE_NAME, NbBundle.getMessage(this.getClass(), "KeywordSearchConfigurationPanel1.customizeComponents.kwListSavedMsg", listName), KeywordSearchUtil.DIALOG_MESSAGE_TYPE.INFO);
+        return true;
+    }
+
     @Override
     public void addPropertyChangeListener(PropertyChangeListener l) {
-        listsManagementPanel.addPropertyChangeListener(l);
-        editListPanel.addPropertyChangeListener(l);
+        super.addPropertyChangeListener(l);
+        /*
+         * There is at least one look and feel library that follows the bad
+         * practice of calling overrideable methods in a constructor, e.g.:
+         *
+         * at
+         * javax.swing.plaf.synth.SynthPanelUI.installListeners(SynthPanelUI.java:83)
+         * at
+         * javax.swing.plaf.synth.SynthPanelUI.installUI(SynthPanelUI.java:63)
+         * at javax.swing.JComponent.setUI(JComponent.java:666) at
+         * javax.swing.JPanel.setUI(JPanel.java:153) at
+         * javax.swing.JPanel.updateUI(JPanel.java:126) at
+         * javax.swing.JPanel.<init>(JPanel.java:86) at
+         * javax.swing.JPanel.<init>(JPanel.java:109) at
+         * javax.swing.JPanel.<init>(JPanel.java:117)
+         *
+         * When this happens, the following child components of this JPanel
+         * subclass have not been constructed yet, since this panel's
+         * constructor has not been called yet.
+         */
+        if (null != listsManagementPanel) {
+            listsManagementPanel.addPropertyChangeListener(l);
+        }
+        if (null != editListPanel) {
+            editListPanel.addPropertyChangeListener(l);
+        }
     }
 
     @Override
     public void removePropertyChangeListener(PropertyChangeListener l) {
+        super.removePropertyChangeListener(l);
         listsManagementPanel.removePropertyChangeListener(l);
         editListPanel.removePropertyChangeListener(l);
     }
@@ -159,14 +209,17 @@ final class GlobalListSettingsPanel extends javax.swing.JPanel implements Option
         rightPanel = new javax.swing.JPanel();
 
         mainSplitPane.setBorder(null);
-        mainSplitPane.setDividerLocation(275);
+        mainSplitPane.setDividerLocation(361);
         mainSplitPane.setDividerSize(1);
+
+        leftPanel.setPreferredSize(new java.awt.Dimension(309, 327));
+        leftPanel.setVerifyInputWhenFocusTarget(false);
 
         javax.swing.GroupLayout leftPanelLayout = new javax.swing.GroupLayout(leftPanel);
         leftPanel.setLayout(leftPanelLayout);
         leftPanelLayout.setHorizontalGroup(
             leftPanelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
-            .addGap(0, 275, Short.MAX_VALUE)
+            .addGap(0, 361, Short.MAX_VALUE)
         );
         leftPanelLayout.setVerticalGroup(
             leftPanelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
@@ -181,7 +234,7 @@ final class GlobalListSettingsPanel extends javax.swing.JPanel implements Option
         rightPanel.setLayout(rightPanelLayout);
         rightPanelLayout.setHorizontalGroup(
             rightPanelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
-            .addGap(0, 397, Short.MAX_VALUE)
+            .addGap(0, 311, Short.MAX_VALUE)
         );
         rightPanelLayout.setVerticalGroup(
             rightPanelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)

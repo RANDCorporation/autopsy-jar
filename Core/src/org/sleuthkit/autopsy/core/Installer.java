@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2014 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,9 +18,13 @@
  */
 package org.sleuthkit.autopsy.core;
 
+import java.awt.Cursor;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import javafx.application.Platform;
@@ -28,8 +32,12 @@ import javafx.embed.swing.JFXPanel;
 import org.openide.modules.ModuleInstall;
 import org.openide.util.NbBundle;
 import org.openide.windows.WindowManager;
+import org.sleuthkit.autopsy.actions.IngestRunningCheck;
+import org.sleuthkit.autopsy.casemodule.Case;
+import static org.sleuthkit.autopsy.core.UserPreferences.SETTINGS_PROPERTIES;
 import org.sleuthkit.autopsy.coreutils.Logger;
 import org.sleuthkit.autopsy.coreutils.MessageNotifyUtil;
+import org.sleuthkit.autopsy.coreutils.ModuleSettings;
 import org.sleuthkit.autopsy.coreutils.PlatformUtil;
 
 /**
@@ -37,6 +45,8 @@ import org.sleuthkit.autopsy.coreutils.PlatformUtil;
  * registered installer in the MANIFEST.MF.
  */
 public class Installer extends ModuleInstall {
+
+    private static final long serialVersionUID = 1L;
 
     private final List<ModuleInstall> packageInstallers;
     private static final Logger logger = Logger.getLogger(Installer.class.getName());
@@ -142,7 +152,9 @@ public class Installer extends ModuleInstall {
                 logger.log(Level.SEVERE, "Error loading VHDI library, ", e); //NON-NLS
             }
 
-            /* PostgreSQL */
+            /*
+             * PostgreSQL
+             */
             try {
                 System.loadLibrary("msvcr120"); //NON-NLS
                 logger.log(Level.INFO, "MSVCR 120 library loaded"); //NON-NLS
@@ -177,7 +189,7 @@ public class Installer extends ModuleInstall {
             } catch (UnsatisfiedLinkError e) {
                 logger.log(Level.SEVERE, "Error loading libintl-8 library, ", e); //NON-NLS
             }
-            
+
             try {
                 System.loadLibrary("libpq"); //NON-NLS
                 logger.log(Level.INFO, "LIBPQ library loaded"); //NON-NLS
@@ -190,11 +202,35 @@ public class Installer extends ModuleInstall {
     public Installer() {
         logger.log(Level.INFO, "core installer created"); //NON-NLS
         javaFxInit = false;
+
+        // Prevent the Autopsy UI from shrinking on high DPI displays
+        System.setProperty("sun.java2d.dpiaware", "false");
+        System.setProperty("prism.allowhidpi", "false");
+        
+        // Update existing configuration in case of unsupported settings
+        updateConfig();
+
         packageInstallers = new ArrayList<>();
         packageInstallers.add(org.sleuthkit.autopsy.coreutils.Installer.getDefault());
         packageInstallers.add(org.sleuthkit.autopsy.corecomponents.Installer.getDefault());
         packageInstallers.add(org.sleuthkit.autopsy.datamodel.Installer.getDefault());
         packageInstallers.add(org.sleuthkit.autopsy.ingest.Installer.getDefault());
+        packageInstallers.add(org.sleuthkit.autopsy.centralrepository.eventlisteners.Installer.getDefault());
+    }
+    
+    /**
+     * If the mode in the configuration file is 'REVIEW' (2, now invalid), this
+     * method will set it to 'STANDALONE' (0) and disable auto ingest.
+     */
+    private void updateConfig() {
+        String mode = ModuleSettings.getConfigSetting(SETTINGS_PROPERTIES, "AutopsyMode");
+        if(mode != null) {
+            int ordinal = Integer.parseInt(mode);
+            if(ordinal > 1) {
+                UserPreferences.setMode(UserPreferences.SelectedMode.STANDALONE);
+                ModuleSettings.setConfigSetting(UserPreferences.SETTINGS_PROPERTIES, "JoinAutoModeCluster", Boolean.toString(false));
+            }
+        }
     }
 
     /**
@@ -212,7 +248,7 @@ public class Installer extends ModuleInstall {
         System.setProperty("javafx.macosx.embedded", "true");
         try {
             // Creating a JFXPanel initializes JavaFX
-            new JFXPanel();
+            JFXPanel panel = new JFXPanel();
             Platform.setImplicitExit(false);
             javaFxInit = true;
         } catch (UnsatisfiedLinkError | NoClassDefFoundError | Exception e) {
@@ -262,7 +298,7 @@ public class Installer extends ModuleInstall {
             logger.log(Level.INFO, "{0} validate()", mi.getClass().getName()); //NON-NLS
             try {
                 mi.validate();
-            } catch (Exception e) {
+            } catch (IllegalStateException e) {
                 logger.log(Level.WARNING, "", e);
             }
         }
@@ -281,6 +317,40 @@ public class Installer extends ModuleInstall {
             } catch (Exception e) {
                 logger.log(Level.WARNING, "", e);
             }
+        }
+    }
+
+    @NbBundle.Messages({
+        "Installer.closing.confirmationDialog.title=Ingest is Running",
+        "Installer.closing.confirmationDialog.message=Ingest is running, are you sure you want to exit?",
+        "# {0} - exception message", "Installer.closing.messageBox.caseCloseExceptionMessage=Error closing case: {0}"
+    })
+    @Override
+    public boolean closing() {
+        if (IngestRunningCheck.checkAndConfirmProceed(Bundle.Installer_closing_confirmationDialog_title(), Bundle.Installer_closing_confirmationDialog_message())) {
+            WindowManager.getDefault().getMainWindow().setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+            FutureTask<Void> future = new FutureTask<>(new Callable<Void>() {
+                @Override
+                public Void call() throws Exception {
+                    Case.closeCurrentCase();
+                    return null;
+                }
+            });
+            Thread thread = new Thread(future);
+            thread.start();
+            try {
+                future.get();
+            } catch (InterruptedException ex) {
+                logger.log(Level.SEVERE, "Unexpected interrupt closing the current case", ex);
+            } catch (ExecutionException ex) {
+                logger.log(Level.SEVERE, "Error closing the current case", ex);
+                MessageNotifyUtil.Message.error(Bundle.Installer_closing_messageBox_caseCloseExceptionMessage(ex.getMessage()));
+            } finally {
+                WindowManager.getDefault().getMainWindow().setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+            }
+            return true;
+        } else {
+            return false;
         }
     }
 

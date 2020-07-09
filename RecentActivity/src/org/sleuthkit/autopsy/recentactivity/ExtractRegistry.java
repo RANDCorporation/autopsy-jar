@@ -51,6 +51,8 @@ import org.xml.sax.InputSource;
 import org.xml.sax.SAXException;
 import java.nio.file.Path;
 import org.sleuthkit.autopsy.ingest.IngestModule.IngestModuleException;
+import org.sleuthkit.autopsy.ingest.IngestServices;
+import org.sleuthkit.autopsy.ingest.ModuleDataEvent;
 
 /**
  * Extract windows registry data using regripper. Runs two versions of
@@ -331,6 +333,10 @@ class ExtractRegistry extends Extract {
             Element oroot = doc.getDocumentElement();
             NodeList children = oroot.getChildNodes();
             int len = children.getLength();
+            // Add all "usb" dataType nodes to collection of BlackboardArtifacts 
+            // that we will submit in a ModuleDataEvent for additional processing.
+            Collection<BlackboardArtifact> usbBBartifacts = new ArrayList<>();
+
             for (int i = 0; i < len; i++) {
                 Element tempnode = (Element) children.item(i);
 
@@ -573,6 +579,8 @@ class ExtractRegistry extends Extract {
 
                                             // index the artifact for keyword search
                                             this.indexArtifact(bbart);
+                                            // add to collection for ModuleDataEvent
+                                            usbBBartifacts.add(bbart);
                                         } catch (TskCoreException ex) {
                                             logger.log(Level.SEVERE, "Error adding device attached artifact to blackboard."); //NON-NLS
                                         }
@@ -641,14 +649,15 @@ class ExtractRegistry extends Extract {
                                             String homeDir = value;
                                             String sid = artnode.getAttribute("sid"); //NON-NLS
                                             String username = artnode.getAttribute("username"); //NON-NLS
-
                                             BlackboardArtifact bbart = regFile.newArtifact(ARTIFACT_TYPE.TSK_OS_ACCOUNT);
-                                            bbart.addAttribute(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_USER_NAME,
+                                            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_USER_NAME,
                                                     parentModuleName, username));
-                                            bbart.addAttribute(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_USER_ID,
+                                            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_USER_ID,
                                                     parentModuleName, sid));
-                                            bbart.addAttribute(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_PATH,
+                                            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_PATH,
                                                     parentModuleName, homeDir));
+                                            
+                                            bbart.addAttributes(bbattributes);
                                             // index the artifact for keyword search
                                             this.indexArtifact(bbart);
                                         } catch (TskCoreException ex) {
@@ -661,10 +670,11 @@ class ExtractRegistry extends Extract {
                                             String localPath = artnode.getAttribute("localPath"); //NON-NLS
                                             String remoteName = value;
                                             BlackboardArtifact bbart = regFile.newArtifact(ARTIFACT_TYPE.TSK_REMOTE_DRIVE);
-                                            bbart.addAttribute(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_LOCAL_PATH,
+                                            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_LOCAL_PATH,
                                                     parentModuleName, localPath));
-                                            bbart.addAttribute(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_REMOTE_PATH,
+                                            bbattributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_REMOTE_PATH,
                                                     parentModuleName, remoteName));
+                                            bbart.addAttributes(bbattributes);
                                             // index the artifact for keyword search
                                             this.indexArtifact(bbart);
                                         } catch (TskCoreException ex) {
@@ -683,8 +693,12 @@ class ExtractRegistry extends Extract {
                                         break;
                                 }
                             }
-                        }   break;
+                        }
+                        break;
                 }
+            } // for
+            if (!usbBBartifacts.isEmpty()) {
+                IngestServices.getInstance().fireModuleDataEvent(new ModuleDataEvent(moduleName, BlackboardArtifact.ARTIFACT_TYPE.TSK_DEVICE_ATTACHED, usbBBartifacts));
             }
             return true;
         } catch (FileNotFoundException ex) {

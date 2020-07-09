@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2014 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,99 +22,61 @@ import java.awt.Dimension;
 import java.awt.Toolkit;
 import java.awt.event.ActionEvent;
 import java.beans.PropertyChangeEvent;
-import java.beans.PropertyChangeListener;
-import java.util.logging.Level;
+import java.util.EnumSet;
 import javax.swing.Action;
 import javax.swing.JDialog;
-import javax.swing.JFrame;
+import javax.swing.SwingUtilities;
 import org.openide.util.HelpCtx;
 import org.openide.util.NbBundle;
 import org.openide.util.actions.CallableSystemAction;
 import org.openide.windows.WindowManager;
-import org.sleuthkit.autopsy.coreutils.Logger;
 
 /**
- * The action to pop up the Case Properties Form window. By using this form,
- * user can update the case properties (for example: updates the case name and
- * removes the image from the current case)
- *
- * @author jantonius
+ * The action associated with the Case/Case Properties menu item. It invokes the
+ * Case Properties dialog.
  */
 final class CasePropertiesAction extends CallableSystemAction {
 
-    private static JDialog popUpWindow;
+    private static final long serialVersionUID = 1L;
+    private static JDialog casePropertiesDialog;
 
-    /**
-     * The CasePropertiesAction constructor
-     */
     CasePropertiesAction() {
-        putValue(Action.NAME, NbBundle.getMessage(CasePropertiesAction.class, "CTL_CasePropertiesAction")); // put the action Name
+        putValue(Action.NAME, NbBundle.getMessage(CasePropertiesAction.class, "CTL_CasePropertiesAction"));
         this.setEnabled(false);
-        Case.addEventSubscriber(Case.Events.CURRENT_CASE.toString(), new PropertyChangeListener() {
-            @Override
-            public void propertyChange(PropertyChangeEvent evt) {
-                popUpWindow = null;
-            }
+        Case.addEventTypeSubscriber(EnumSet.of(Case.Events.CURRENT_CASE), (PropertyChangeEvent evt) -> {
+            setEnabled(null != evt.getNewValue());
         });
     }
 
-    /**
-     * Pop-up the Case Properties Form window where user can change the case
-     * properties (example: update case name and remove the image from the case)
-     */
     @Override
     public void performAction() {
-        if (popUpWindow == null) {
-            // create the popUp window for it
+        SwingUtilities.invokeLater(() -> {
             String title = NbBundle.getMessage(this.getClass(), "CasePropertiesAction.window.title");
-            popUpWindow = new JDialog((JFrame) WindowManager.getDefault().getMainWindow(), title, false);
-            try {
+            casePropertiesDialog = new JDialog(WindowManager.getDefault().getMainWindow(), title, true);
+            CaseInformationPanel caseInformationPanel = new CaseInformationPanel();
+            caseInformationPanel.addCloseButtonAction((ActionEvent e) -> {
+                casePropertiesDialog.setVisible(false);
+            });
+            casePropertiesDialog.add(caseInformationPanel);
+            casePropertiesDialog.setResizable(true);
+            casePropertiesDialog.pack();
 
-                CaseInformationPanel caseInformationPanel = new CaseInformationPanel();
-                caseInformationPanel.addCloseButtonAction((ActionEvent e) -> {
-                    popUpWindow.dispose();
-                });
-
-                popUpWindow.add(caseInformationPanel);
-                popUpWindow.setResizable(true);
-                popUpWindow.pack();
-
-                // set the location of the popUp Window on the center of the screen
-                Dimension screenDimension = Toolkit.getDefaultToolkit().getScreenSize();
-                double w = popUpWindow.getSize().getWidth();
-                double h = popUpWindow.getSize().getHeight();
-                popUpWindow.setLocation((int) ((screenDimension.getWidth() - w) / 2), (int) ((screenDimension.getHeight() - h) / 2));
-
-                popUpWindow.setVisible(true);
-            } catch (Exception ex) {
-                Logger.getLogger(CasePropertiesAction.class.getName()).log(Level.WARNING, "Error displaying Case Properties window.", ex); //NON-NLS
-            }
-        }
-        popUpWindow.setVisible(true);
-        popUpWindow.toFront();
+            Dimension screenDimension = Toolkit.getDefaultToolkit().getScreenSize();
+            double w = casePropertiesDialog.getSize().getWidth();
+            double h = casePropertiesDialog.getSize().getHeight();
+            casePropertiesDialog.setLocation((int) ((screenDimension.getWidth() - w) / 2), (int) ((screenDimension.getHeight() - h) / 2));
+            casePropertiesDialog.setVisible(true);
+            casePropertiesDialog.toFront();
+        });
     }
 
-    /**
-     * Gets the name of this action. This may be presented as an item in a menu.
-     *
-     * @return actionName
-     */
     @Override
     public String getName() {
         return NbBundle.getMessage(CasePropertiesAction.class, "CTL_CasePropertiesAction");
     }
 
-    /**
-     * Gets the HelpCtx associated with implementing object
-     *
-     * @return HelpCtx or HelpCtx.DEFAULT_HELP
-     */
     @Override
     public HelpCtx getHelpCtx() {
         return HelpCtx.DEFAULT_HELP;
-    }
-
-    static void closeCasePropertiesWindow() {
-        popUpWindow.dispose();
     }
 }

@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2015 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,56 +28,53 @@ import org.openide.WizardValidationException;
 import org.openide.util.HelpCtx;
 import org.openide.windows.WindowManager;
 import java.awt.Cursor;
-import org.sleuthkit.autopsy.casemodule.Case.CaseType;
+import java.util.logging.Level;
+import org.sleuthkit.autopsy.centralrepository.datamodel.EamDb;
+import org.sleuthkit.autopsy.coreutils.Logger;
+import org.sleuthkit.autopsy.coreutils.ModuleSettings;
 
 /**
- * The "New Case" wizard panel with a component on it. This class represents
- * data of wizard step. It defers creation and initialization of UI component of
- * wizard panel into getComponent() method.
- *
- * @author jantonius
+ * The second panel of the New Case wizard.
  */
 class NewCaseWizardPanel2 implements WizardDescriptor.ValidatingPanel<WizardDescriptor> {
 
-    /**
-     * The visual component that displays this panel. If you need to access the
-     * component from this class, just use getComponent().
-     */
+    private static final Logger logger = Logger.getLogger(NewCaseWizardPanel2.class.getName());
+    private static final String PROP_EXAMINER_NAME = "LBL_EXAMINER_NAME"; //NON-NLS
+    private static final String PROP_EXAMINER_PHONE = "LBL_EXAMINER_PHONE"; //NON-NLS
+    private static final String PROP_EXAMINER_EMAIL = "LBL_EXAMINER_EMAIL"; //NON-NLS
+    private static final String PROP_CASE_NOTES = "LBL_CASE_NOTES"; //NON-NLS
+    private static final String PROP_ORGANIZATION_NAME = "LBL_ORGANIZATION_NAME"; //NON-NLS
     private NewCaseVisualPanel2 component;
-    private Boolean isFinish = true;
-    private String caseName;
-    private String caseDir;
-    private String createdDirectory;
-    private CaseType caseType;
+    private final Set<ChangeListener> listeners = new HashSet<>(1);
 
     /**
-     * Get the visual component for the panel. In this template, the component
-     * is kept separate. This can be more efficient: if the wizard is created
-     * but never displayed, or not all panels are displayed, it is better to
-     * create only those which really need to be visible.
+     * Get the visual component for the panel.
      *
-     * @return component the UI component of this wizard panel
+     * @return component The UI component of this wizard panel.
      */
     @Override
     public NewCaseVisualPanel2 getComponent() {
         if (component == null) {
             component = new NewCaseVisualPanel2();
+        } else {
+            component.refreshCaseDetailsFields();
         }
+
         return component;
     }
 
     /**
-     * Help for this panel. When the panel is active, this is used as the help
-     * for the wizard dialog.
+     * Gets the help object for this panel. When the panel is active, this is
+     * used as the help for the wizard dialog.
      *
-     * @return HelpCtx.DEFAULT_HELP the help for this panel
+     * @return The help for this panel.
      */
     @Override
     public HelpCtx getHelp() {
-        // Show no Help button for this panel:
+        /*
+         * Currently, no help is provided for this panel.
+         */
         return HelpCtx.DEFAULT_HELP;
-        // If you have context help:
-        // return new HelpCtx(SampleWizardPanel1.class);
     }
 
     /**
@@ -89,43 +86,35 @@ class NewCaseWizardPanel2 implements WizardDescriptor.ValidatingPanel<WizardDesc
      */
     @Override
     public boolean isValid() {
-        // If it is always OK to press Next or Finish, then:
-        return isFinish;
-        // If it depends on some condition (form filled out...), then:
-        // return someCondition();
-        // and when this condition changes (last form field filled in...) then:
-        // fireChangeEvent();
-        // and uncomment the complicated stuff below.
+        return true;
     }
-    private final Set<ChangeListener> listeners = new HashSet<ChangeListener>(1); // or can use ChangeSupport in NB 6.0
 
     /**
-     * Adds a listener to changes of the panel's validity.
+     * Adds a change listener to this panel.
      *
-     * @param l the change listener to add
+     * @param listener The change listener to add.
      */
     @Override
-    public final void addChangeListener(ChangeListener l) {
+    public final void addChangeListener(ChangeListener listener) {
         synchronized (listeners) {
-            listeners.add(l);
+            listeners.add(listener);
         }
     }
 
     /**
-     * Removes a listener to changes of the panel's validity.
+     * Removes a change listener from this panel.
      *
-     * @param l the change listener to move
+     * @param listener The change listener to remove.
      */
     @Override
-    public final void removeChangeListener(ChangeListener l) {
+    public final void removeChangeListener(ChangeListener listener) {
         synchronized (listeners) {
-            listeners.remove(l);
+            listeners.remove(listener);
         }
     }
 
     /**
-     * This method is auto-generated. It seems that this method is used to
-     * listen to any change in this wizard panel.
+     * Notifies any registerd change listeners of a change in the panel.
      */
     protected final void fireChangeEvent() {
         Iterator<ChangeListener> it;
@@ -138,10 +127,6 @@ class NewCaseWizardPanel2 implements WizardDescriptor.ValidatingPanel<WizardDesc
         }
     }
 
-    // You can use a settings object to keep track of state. Normally the
-    // settings object will be the WizardDescriptor, so you can use
-    // WizardDescriptor.getProperty & putProperty to store information entered
-    // by the user.
     /**
      * Provides the wizard panel with the current data--either the default data
      * or already-modified settings, if the user used the previous and/or next
@@ -152,10 +137,22 @@ class NewCaseWizardPanel2 implements WizardDescriptor.ValidatingPanel<WizardDesc
      */
     @Override
     public void readSettings(WizardDescriptor settings) {
-        caseName = (String) settings.getProperty("caseName"); //NON-NLS
-        caseDir = (String) settings.getProperty("caseParentDir"); //NON-NLS
-        createdDirectory = (String) settings.getProperty("createdDirectory"); //NON-NLS
-        caseType = CaseType.values()[(int) settings.getProperty("caseType")]; //NON-NLS
+        NewCaseVisualPanel2 panel = getComponent();
+        try {
+            String lastExaminerName = ModuleSettings.getConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_EXAMINER_NAME);
+            String lastExaminerPhone = ModuleSettings.getConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_EXAMINER_PHONE);
+            String lastExaminerEmail = ModuleSettings.getConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_EXAMINER_EMAIL);
+            String lastCaseNotes = ModuleSettings.getConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_CASE_NOTES);
+            String lastOrganizationName = ModuleSettings.getConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_ORGANIZATION_NAME);
+            panel.setExaminerName(lastExaminerName);
+            panel.setExaminerPhone(lastExaminerPhone);
+            panel.setExaminerEmail(lastExaminerEmail);
+            panel.setCaseNotes(lastCaseNotes);
+            panel.setOrganization(EamDb.isEnabled() ? lastOrganizationName : "");
+            panel.setCaseNumber("");  //clear the number field 
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "Could not read wizard settings in NewCaseWizardPanel2, ", e); //NON-NLS
+        }
     }
 
     /**
@@ -169,9 +166,17 @@ class NewCaseWizardPanel2 implements WizardDescriptor.ValidatingPanel<WizardDesc
      */
     @Override
     public void storeSettings(WizardDescriptor settings) {
-        NewCaseVisualPanel2 currentComponent = getComponent();
-        settings.putProperty("caseNumber", currentComponent.getCaseNumber()); //NON-NLS
-        settings.putProperty("caseExaminer", currentComponent.getExaminer()); //NON-NLS
+        settings.putProperty("caseNumber", component.getCaseNumber()); //NON-NLS
+        settings.putProperty("caseExaminerName", component.getExaminerName()); //NON-NLS
+        ModuleSettings.setConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_EXAMINER_NAME, component.getExaminerName());
+        settings.putProperty("caseExaminerPhone", component.getExaminerPhone()); //NON-NLS
+        ModuleSettings.setConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_EXAMINER_PHONE, component.getExaminerPhone());
+        settings.putProperty("caseExaminerEmail", component.getExaminerEmail()); //NON-NLS
+        ModuleSettings.setConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_EXAMINER_EMAIL, component.getExaminerEmail());
+        settings.putProperty("caseNotes", component.getCaseNotes()); //NON-NLS
+        ModuleSettings.setConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_CASE_NOTES, component.getCaseNotes());
+        settings.putProperty("caseOrganization", component.getOrganization()); //NON-NLS
+        ModuleSettings.setConfigSetting(ModuleSettings.MAIN_SETTINGS, PROP_ORGANIZATION_NAME, component.getOrganization());
     }
 
     @Override

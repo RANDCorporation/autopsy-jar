@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2014 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,173 +18,167 @@
  */
 package org.sleuthkit.autopsy.directorytree;
 
-import java.awt.event.ActionEvent;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.logging.Level;
-import javax.swing.AbstractAction;
 import javax.swing.Action;
 import org.openide.nodes.FilterNode;
 import org.openide.nodes.Node;
 import org.openide.util.NbBundle;
 import org.openide.util.lookup.Lookups;
 import org.openide.util.lookup.ProxyLookup;
+import org.sleuthkit.autopsy.core.UserPreferences;
 import org.sleuthkit.autopsy.coreutils.Logger;
 import org.sleuthkit.autopsy.datamodel.AbstractContentNode;
-import org.sleuthkit.autopsy.datamodel.DisplayableItemNode;
-import org.sleuthkit.autopsy.ingest.RunIngestModulesDialog;
+import org.sleuthkit.autopsy.datamodel.BlackboardArtifactNode;
+import org.sleuthkit.autopsy.ingest.runIngestModuleWizard.RunIngestModulesAction;
 import org.sleuthkit.datamodel.AbstractFile;
+import org.sleuthkit.datamodel.BlackboardArtifact;
+import org.sleuthkit.datamodel.BlackboardArtifact.ARTIFACT_TYPE;
 import org.sleuthkit.datamodel.Content;
 import org.sleuthkit.datamodel.Directory;
 import org.sleuthkit.datamodel.Image;
 import org.sleuthkit.datamodel.TskCoreException;
+import org.sleuthkit.datamodel.TskData;
 import org.sleuthkit.datamodel.VirtualDirectory;
+import org.sleuthkit.datamodel.Volume;
 
 /**
- * This class sets the actions for the nodes in the directory tree and creates
- * the children filter so that files and such are hidden from the tree.
- *
+ * A node filter (decorator) that sets the actions for a node in the tree view
+ * and wraps the Children object of the wrapped node with a
+ * DirectoryTreeFilterChildren.
  */
 class DirectoryTreeFilterNode extends FilterNode {
 
-    private static final Action collapseAll = new CollapseAction(
-            NbBundle.getMessage(DirectoryTreeFilterNode.class, "DirectoryTreeFilterNode.action.collapseAll.text"));
-
     private static final Logger logger = Logger.getLogger(DirectoryTreeFilterNode.class.getName());
+    private static final Action collapseAllAction = new CollapseAction(NbBundle.getMessage(DirectoryTreeFilterNode.class, "DirectoryTreeFilterNode.action.collapseAll.text"));
 
     /**
-     * the constructor
+     * Constructs node filter (decorator) that sets the actions for a node in
+     * the tree view and wraps the Children object of the wrapped node with a
+     * DirectoryTreeFilterChildren.
+     *
+     * @param nodeToWrap     The node to wrap.
+     * @param createChildren Whether to create the children of the wrapped node
+     *                       or treat it a a leaf node.
      */
-    DirectoryTreeFilterNode(Node arg, boolean createChildren) {
-        super(arg, DirectoryTreeFilterChildren.createInstance(arg, createChildren),
-                new ProxyLookup(Lookups.singleton(new OriginalNode(arg)),
-                        arg.getLookup()));
+    DirectoryTreeFilterNode(Node nodeToWrap, boolean createChildren) {
+        super(nodeToWrap,
+                DirectoryTreeFilterChildren.createInstance(nodeToWrap, createChildren),
+                new ProxyLookup(Lookups.singleton(nodeToWrap), nodeToWrap.getLookup()));
     }
 
+    /**
+     * Gets the display name for the wrapped node, possibly including a child
+     * count in parentheses.
+     *
+     * @return The display name for the node.
+     */
     @Override
     public String getDisplayName() {
         final Node orig = getOriginal();
-
         String name = orig.getDisplayName();
 
-        //do not show children counts for non content nodes
         if (orig instanceof AbstractContentNode) {
-            //show only for file content nodes
             AbstractFile file = getLookup().lookup(AbstractFile.class);
-            if (file != null) {
+            if ((file != null) && (false == (orig instanceof BlackboardArtifactNode))) {
                 try {
-                    final int numChildren = file.getChildrenCount();
-                    
-                    // left-to-right marks here are necessary to keep the count and parens together
-                    // for mixed right-to-left and left-to-right names
-                    name = name + " \u200E(\u200E" + numChildren + ")\u200E";
+                    int numVisibleChildren = getVisibleChildCount(file);
+
+                    /*
+                     * Left-to-right marks here are necessary to keep the count
+                     * and parens together for mixed right-to-left and
+                     * left-to-right names.
+                     */
+                    name = name + " \u200E(\u200E" + numVisibleChildren + ")\u200E";  //NON-NLS
+
                 } catch (TskCoreException ex) {
                     logger.log(Level.SEVERE, "Error getting children count to display for file: " + file, ex); //NON-NLS
                 }
-
+            } else if (orig instanceof BlackboardArtifactNode) {
+                BlackboardArtifact artifact = ((BlackboardArtifactNode) orig).getArtifact();
+                try {
+                    int numAttachments = artifact.getChildrenCount();
+                    name = name + " \u200E(\u200E" + numAttachments + ")\u200E";  //NON-NLS
+                } catch (TskCoreException ex) {
+                    logger.log(Level.SEVERE, "Error getting chidlren count for atifact: " + artifact, ex); //NON-NLS
+                }
             }
         }
-
         return name;
     }
 
     /**
-     * Right click action for the nodes in the directory tree.
+     * Gets the number of visible children for a tree view node representing an
+     * AbstractFile. Depending on the user preferences, known and/or slack files
+     * will either be included or purged in the count.
      *
-     * @param popup
+     * @param file The AbstractFile object whose children will be counted.
+     *
+     * @return The number of visible children.
+     */
+    private int getVisibleChildCount(AbstractFile file) throws TskCoreException {
+        List<Content> childList = file.getChildren();
+
+        int numVisibleChildren = childList.size();
+        boolean purgeKnownFiles = UserPreferences.hideKnownFilesInDataSourcesTree();
+        boolean purgeSlackFiles = UserPreferences.hideSlackFilesInDataSourcesTree();
+
+        if (purgeKnownFiles || purgeSlackFiles) {
+            // Purge known and/or slack files from the file count
+            for (int i = 0; i < childList.size(); i++) {
+                Content child = childList.get(i);
+                if (child instanceof AbstractFile) {
+                    AbstractFile childFile = (AbstractFile) child;
+                    if ((purgeKnownFiles && childFile.getKnown() == TskData.FileKnown.KNOWN)
+                            || (purgeSlackFiles && childFile.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.SLACK)) {
+                        numVisibleChildren--;
+                    }
+                } else if (child instanceof BlackboardArtifact) {
+                    BlackboardArtifact bba = (BlackboardArtifact) child;
+
+                    // Only message type artifacts are displayed in the tree
+                    if ((bba.getArtifactTypeID() != ARTIFACT_TYPE.TSK_EMAIL_MSG.getTypeID())
+                            && (bba.getArtifactTypeID() != ARTIFACT_TYPE.TSK_MESSAGE.getTypeID())) {
+                        numVisibleChildren--;
+                    }
+                }
+            }
+        }
+
+        return numVisibleChildren;
+    }
+
+    /**
+     * Gets the context mneu (right click menu) actions for the wrapped node.
+     *
+     * @param context Whether to find actions for context meaning or for the
+     *                node itself.
      *
      * @return
      */
     @Override
-    public Action[] getActions(boolean popup) {
+    public Action[] getActions(boolean context) {
         List<Action> actions = new ArrayList<>();
-
+        
         final Content content = this.getLookup().lookup(Content.class);
         if (content != null) {
-            actions.addAll(DirectoryTreeFilterNode.getDetailActions(content));
-
-            //extract dir action
-            Directory dir = this.getLookup().lookup(Directory.class);
-            if (dir != null) {
-                actions.add(ExtractAction.getInstance());
-                actions.add(new AbstractAction(
-                        NbBundle.getMessage(this.getClass(), "DirectoryTreeFilterNode.action.runIngestMods.text")) {
-                            @Override
-                            public void actionPerformed(ActionEvent e) {
-                                final RunIngestModulesDialog ingestDialog = new RunIngestModulesDialog(dir);
-                                ingestDialog.display();
-                            }
-                        });
-            }
-
-            final Image img = this.getLookup().lookup(Image.class);
-
-            VirtualDirectory virtualDirectory = this.getLookup().lookup(VirtualDirectory.class);
-            // determine if the virtualDireory is at root-level (Logical File Set).
-            boolean isRootVD = false;
-            if (virtualDirectory != null) {
-                try {
-                    if (virtualDirectory.getParent() == null) {
-                        isRootVD = true;
-                    }
-                } catch (TskCoreException ex) {
-                    logger.log(Level.WARNING, "Error determining the parent of the virtual directory", ex); // NON-NLS
-                }
-            }
-
-            // 'run ingest' action and 'file search' action are added only if the
-            // selected node is img node or a root level virtual directory.
-            if (img != null || isRootVD) {
-                actions.add(new FileSearchAction(
-                        NbBundle.getMessage(this.getClass(), "DirectoryTreeFilterNode.action.openFileSrcByAttr.text")));
-                actions.add(new AbstractAction(
-                        NbBundle.getMessage(this.getClass(), "DirectoryTreeFilterNode.action.runIngestMods.text")) {
-                            @Override
-                            public void actionPerformed(ActionEvent e) {
-                                final RunIngestModulesDialog ingestDialog = new RunIngestModulesDialog(Collections.<Content>singletonList(content));
-                                ingestDialog.display();
-                            }
-                        });
-            }
+            actions.addAll(Arrays.asList(super.getActions(true)));
         }
-
-        //check if delete actions should be added
-        final Node orig = getOriginal();
-        //TODO add a mechanism to determine if DisplayableItemNode
-        if (orig instanceof DisplayableItemNode) {
-            actions.addAll(getDeleteActions((DisplayableItemNode) orig));
-        }
-
-        actions.add(collapseAll);
+        actions.add(collapseAllAction);
         return actions.toArray(new Action[actions.size()]);
     }
 
-    private static List<Action> getDeleteActions(DisplayableItemNode original) {
-        List<Action> actions = new ArrayList<>();
-        //actions.addAll(original.accept(getDeleteActionVisitor));
-        return actions;
+    /**
+     * Get the wrapped node.
+     *
+     * @return
+     */
+    @Override
+    public Node getOriginal() {
+        return super.getOriginal();
     }
 
-    private static List<Action> getDetailActions(Content c) {
-        List<Action> actions = new ArrayList<>();
-
-        actions.addAll(ExplorerNodeActionVisitor.getActions(c));
-
-        return actions;
-    }
-
-    //FIXME: this seems like a big hack -jm
-    public static class OriginalNode {
-
-        private final Node original;
-
-        OriginalNode(Node original) {
-            this.original = original;
-        }
-
-        Node getNode() {
-            return original;
-        }
-    }
 }

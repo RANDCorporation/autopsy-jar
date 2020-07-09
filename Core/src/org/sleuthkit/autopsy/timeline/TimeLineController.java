@@ -575,7 +575,6 @@ public class TimeLineController {
             Case.addPropertyChangeListener(caseListener);
             listeningToAutopsy = true;
         }
-
         Platform.runLater(() -> promptForRebuild(file, artifact));
     }
 
@@ -699,7 +698,9 @@ public class TimeLineController {
         if (topComponent == null) {
             topComponent = new TimeLineTopComponent(this);
         }
-        topComponent.open();
+        if (topComponent.isOpened() == false) {
+            topComponent.open();
+        }
         topComponent.toFront();
         /*
          * Make this top component active so its ExplorerManager's lookup gets

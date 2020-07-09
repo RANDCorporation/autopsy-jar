@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,7 +30,6 @@ import java.util.logging.Level;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.commons.lang.StringUtils;
-import org.apache.commons.validator.routines.checkdigit.LuhnCheckDigit;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.response.TermsResponse.Term;
 import org.sleuthkit.autopsy.coreutils.Logger;
@@ -42,6 +41,7 @@ import org.sleuthkit.datamodel.BlackboardArtifact;
 import org.sleuthkit.datamodel.BlackboardArtifact.ARTIFACT_TYPE;
 import org.sleuthkit.datamodel.BlackboardAttribute;
 import org.sleuthkit.datamodel.BlackboardAttribute.ATTRIBUTE_TYPE;
+import org.sleuthkit.datamodel.Content;
 import org.sleuthkit.datamodel.TskCoreException;
 import org.sleuthkit.datamodel.TskData;
 
@@ -56,25 +56,32 @@ final class TermsComponentQuery implements KeywordSearchQuery {
     private static final Logger LOGGER = Logger.getLogger(TermsComponentQuery.class.getName());
     private static final String MODULE_NAME = KeywordSearchModuleFactory.getModuleName();
     private static final String SEARCH_HANDLER = "/terms"; //NON-NLS
-    private static final String SEARCH_FIELD = Server.Schema.CONTENT_WS.toString();
+    private static final String SEARCH_FIELD = Server.Schema.TEXT.toString();
     private static final int TERMS_SEARCH_TIMEOUT = 90 * 1000; // Milliseconds
     private static final String CASE_INSENSITIVE = "case_insensitive"; //NON-NLS
     private static final boolean DEBUG_FLAG = Version.Type.DEVELOPMENT.equals(Version.getBuildType());
     private static final int MAX_TERMS_QUERY_RESULTS = 20000;
+
     private final KeywordList keywordList;
-    private final Keyword keyword;
+    private final Keyword originalKeyword;
+    private final List<KeywordQueryFilter> filters = new ArrayList<>(); // THIS APPEARS TO BE UNUSED
+
     private String searchTerm;
     private boolean searchTermIsEscaped;
-    private final List<KeywordQueryFilter> filters = new ArrayList<>(); // THIS APPEARS TO BE UNUSED
 
     /*
      * The following fields are part of the initial implementation of credit
      * card account search and should be factored into another class when time
      * permits.
      */
-    private static final Pattern CREDIT_CARD_NUM_PATTERN = Pattern.compile("(?<ccn>[3456]([ -]?\\d){11,18})");   //12-19 digits, with possible single spaces or dashes in between. First digit is 3,4,5, or 6 //NON-NLS
-    private static final LuhnCheckDigit CREDIT_CARD_NUM_LUHN_CHECK = new LuhnCheckDigit();
-    private static final Pattern CREDIT_CARD_TRACK1_PATTERN = Pattern.compile(
+    /**
+     * 12-19 digits, with possible single spaces or dashes in between. First
+     * digit is 2 through 6
+     *
+     */
+    static final Pattern CREDIT_CARD_NUM_PATTERN
+            = Pattern.compile("(?<ccn>[2-6]([ -]?[0-9]){11,18})");
+    static final Pattern CREDIT_CARD_TRACK1_PATTERN = Pattern.compile(
             /*
              * Track 1 is alphanumeric.
              *
@@ -86,7 +93,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
             "(?:" //begin nested optinal group //NON-NLS
             + "%?" //optional start sentinal: % //NON-NLS
             + "B)?" //format code  //NON-NLS
-            + "(?<accountNumber>[3456]([ -]?\\d){11,18})" //12-19 digits, with possible single spaces or dashes in between. first digit is 3,4,5, or 6 //NON-NLS
+            + "(?<accountNumber>[2-6]([ -]?[0-9]){11,18})" //12-19 digits, with possible single spaces or dashes in between. first digit is 2,3,4,5, or 6 //NON-NLS
             + "\\^" //separator //NON-NLS
             + "(?<name>[^^]{2,26})" //2-26 charachter name, not containing ^ //NON-NLS
             + "(?:\\^" //separator //NON-NLS
@@ -96,7 +103,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
             + "(?:\\?" // end sentinal: ? //NON-NLS
             + "(?<LRC>.)" //longitudinal redundancy check //NON-NLS
             + "?)?)?)?)?)?");//close nested optional groups //NON-NLS
-    private static final Pattern CREDIT_CARD_TRACK2_PATTERN = Pattern.compile(
+    static final Pattern CREDIT_CARD_TRACK2_PATTERN = Pattern.compile(
             /*
              * Track 2 is numeric plus six punctuation symbolls :;<=>?
              *
@@ -107,7 +114,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
              *
              */
             "[:;<=>?]?" //(optional)start sentinel //NON-NLS
-            + "(?<accountNumber>[3456]([ -]?\\d){11,18})" //12-19 digits, with possible single spaces or dashes in between. first digit is 3,4,5, or 6 //NON-NLS
+            + "(?<accountNumber>[2-6]([ -]?[0-9]){11,18})" //12-19 digits, with possible single spaces or dashes in between. first digit is 2,3,4,5, or 6 //NON-NLS
             + "(?:[:;<=>?]" //separator //NON-NLS
             + "(?:(?<expiration>\\d{4})" //4 digit expiration date YYMM //NON-NLS
             + "(?:(?<serviceCode>\\d{3})" //3 digit service code //NON-NLS
@@ -115,7 +122,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
             + "(?:[:;<=>?]" //end sentinel //NON-NLS
             + "(?<LRC>.)" //longitudinal redundancy check //NON-NLS
             + "?)?)?)?)?)?"); //close nested optional groups //NON-NLS
-    private static final BlackboardAttribute.Type KEYWORD_SEARCH_DOCUMENT_ID = new BlackboardAttribute.Type(ATTRIBUTE_TYPE.TSK_KEYWORD_SEARCH_DOCUMENT_ID);
+    static final BlackboardAttribute.Type KEYWORD_SEARCH_DOCUMENT_ID = new BlackboardAttribute.Type(ATTRIBUTE_TYPE.TSK_KEYWORD_SEARCH_DOCUMENT_ID);
 
     /**
      * Constructs an object that implements a regex query that will be performed
@@ -135,7 +142,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
     // if needed, here in the constructor?
     TermsComponentQuery(KeywordList keywordList, Keyword keyword) {
         this.keywordList = keywordList;
-        this.keyword = keyword;
+        this.originalKeyword = keyword;
         this.searchTerm = keyword.getSearchTerm();
     }
 
@@ -158,7 +165,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
      */
     @Override
     public String getQueryString() {
-        return keyword.getSearchTerm();
+        return originalKeyword.getSearchTerm();
     }
 
     /**
@@ -187,7 +194,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
      */
     @Override
     public void escape() {
-        searchTerm = Pattern.quote(keyword.getSearchTerm());
+        searchTerm = Pattern.quote(originalKeyword.getSearchTerm());
         searchTermIsEscaped = true;
     }
 
@@ -280,17 +287,16 @@ final class TermsComponentQuery implements KeywordSearchQuery {
         /*
          * Do a term query for each term that matched the regex.
          */
-        QueryResults results = new QueryResults(this, keywordList);
+        QueryResults results = new QueryResults(this);
         for (Term term : terms) {
             /*
              * If searching for credit card account numbers, do a Luhn check on
              * the term and discard it if it does not pass.
              */
-            if (keyword.getArtifactAttributeType() == ATTRIBUTE_TYPE.TSK_CARD_NUMBER) {
+            if (originalKeyword.getArtifactAttributeType() == ATTRIBUTE_TYPE.TSK_CARD_NUMBER) {
                 Matcher matcher = CREDIT_CARD_NUM_PATTERN.matcher(term.getTerm());
-                matcher.find();
-                final String ccn = CharMatcher.anyOf(" -").removeFrom(matcher.group("ccn"));
-                if (false == CREDIT_CARD_NUM_LUHN_CHECK.isValid(ccn)) {
+                if (false == matcher.find()
+                        || false == CreditCardValidator.isValidCCN(matcher.group("ccn"))) {
                     continue;
                 }
             }
@@ -306,36 +312,36 @@ final class TermsComponentQuery implements KeywordSearchQuery {
              * query.
              */
             String escapedTerm = KeywordSearchUtil.escapeLuceneQuery(term.getTerm());
-            LuceneQuery termQuery = new LuceneQuery(keywordList, new Keyword(escapedTerm, true));
+            LuceneQuery termQuery = new LuceneQuery(keywordList, new Keyword(escapedTerm, true, true));
             filters.forEach(termQuery::addFilter); // This appears to be unused
             QueryResults termQueryResult = termQuery.performQuery();
             Set<KeywordHit> termHits = new HashSet<>();
             for (Keyword word : termQueryResult.getKeywords()) {
                 termHits.addAll(termQueryResult.getResults(word));
             }
-            results.addResult(new Keyword(term.getTerm(), false), new ArrayList<>(termHits));
+            results.addResult(new Keyword(term.getTerm(), false, true, originalKeyword.getListName(), originalKeyword.getOriginalTerm()), new ArrayList<>(termHits));
         }
         return results;
     }
 
     /**
-     * Converts the keyword hits for a given search term into artifacts.
+     * Posts a keyword hit artifact to the blackboard for a given keyword hit.
      *
-     * @param searchTerm The search term.
-     * @param hit        The keyword hit.
-     * @param snippet    The document snippet that contains the hit
-     * @param listName   The name of the keyword list that contained the keyword
-     *                   for which the hit was found.
+     * @param content      The text source object for the hit.
+     * @param foundKeyword The keyword that was found by the search, this may be
+     *                     different than the Keyword that was searched if, for
+     *                     example, it was a RegexQuery.
+     * @param hit          The keyword hit.
+     * @param snippet      A snippet from the text that contains the hit.
+     * @param listName     The name of the keyword list that contained the
+     *                     keyword for which the hit was found.
      *
-     * 
      *
-     * @return An object that wraps an artifact and a mapping by id of its
-     *         attributes.
+     * @return The newly created artifact or null if there was a problem
+     *         creating it.
      */
-    // TODO: Are we actually making meaningful use of the KeywordCachedArtifact
-    // class?
     @Override
-    public KeywordCachedArtifact writeSingleFileHitsToBlackBoard(String searchTerm, KeywordHit hit, String snippet, String listName) {
+    public BlackboardArtifact postKeywordHitToBlackboard(Content content, Keyword foundKeyword, KeywordHit hit, String snippet, String listName) {
         /*
          * Create either a "plain vanilla" keyword hit artifact with keyword and
          * regex attributes, or a credit card account artifact with attributes
@@ -344,11 +350,12 @@ final class TermsComponentQuery implements KeywordSearchQuery {
          */
         BlackboardArtifact newArtifact;
         Collection<BlackboardAttribute> attributes = new ArrayList<>();
-        if (keyword.getArtifactAttributeType() != ATTRIBUTE_TYPE.TSK_CARD_NUMBER) {
-            attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_KEYWORD, MODULE_NAME, searchTerm));
-            attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_KEYWORD_REGEXP, MODULE_NAME, keyword.getSearchTerm()));
+        if (originalKeyword.getArtifactAttributeType() != ATTRIBUTE_TYPE.TSK_CARD_NUMBER) {
+            attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_KEYWORD, MODULE_NAME, foundKeyword.getSearchTerm()));
+            attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_KEYWORD_REGEXP, MODULE_NAME, originalKeyword.getSearchTerm()));
+
             try {
-                newArtifact = hit.getContent().newArtifact(ARTIFACT_TYPE.TSK_KEYWORD_HIT);
+                newArtifact = content.newArtifact(ARTIFACT_TYPE.TSK_KEYWORD_HIT);
 
             } catch (TskCoreException ex) {
                 LOGGER.log(Level.SEVERE, "Error adding artifact for keyword hit to blackboard", ex); //NON-NLS
@@ -359,7 +366,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
              * Parse the credit card account attributes from the snippet for the
              * hit.
              */
-            attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_ACCOUNT_TYPE, MODULE_NAME, Account.Type.CREDIT_CARD.name()));
+            attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_ACCOUNT_TYPE, MODULE_NAME, Account.Type.CREDIT_CARD.getTypeName()));
             Map<BlackboardAttribute.Type, BlackboardAttribute> parsedTrackAttributeMap = new HashMap<>();
             Matcher matcher = CREDIT_CARD_TRACK1_PATTERN.matcher(hit.getSnippet());
             if (matcher.find()) {
@@ -372,9 +379,9 @@ final class TermsComponentQuery implements KeywordSearchQuery {
             final BlackboardAttribute ccnAttribute = parsedTrackAttributeMap.get(new BlackboardAttribute.Type(ATTRIBUTE_TYPE.TSK_CARD_NUMBER));
             if (ccnAttribute == null || StringUtils.isBlank(ccnAttribute.getValueString())) {
                 if (hit.isArtifactHit()) {
-                    LOGGER.log(Level.SEVERE, String.format("Failed to parse credit card account number for artifact keyword hit: term = %s, snippet = '%s', artifact id = %d", searchTerm, hit.getSnippet(), hit.getArtifact().getArtifactID())); //NON-NLS
+                    LOGGER.log(Level.SEVERE, String.format("Failed to parse credit card account number for artifact keyword hit: term = %s, snippet = '%s', artifact id = %d", searchTerm, hit.getSnippet(), hit.getArtifactID().get())); //NON-NLS
                 } else {
-                    LOGGER.log(Level.SEVERE, String.format("Failed to parse credit card account number for content keyword hit: term = %s, snippet = '%s', object id = %d", searchTerm, hit.getSnippet(), hit.getContent().getId())); //NON-NLS
+                    LOGGER.log(Level.SEVERE, String.format("Failed to parse credit card account number for content keyword hit: term = %s, snippet = '%s', object id = %d", searchTerm, hit.getSnippet(), hit.getSolrObjectId())); //NON-NLS
                 }
                 return null;
             }
@@ -410,8 +417,8 @@ final class TermsComponentQuery implements KeywordSearchQuery {
              * document id to support showing just the chunk that contained the
              * hit.
              */
-            if (hit.getContent() instanceof AbstractFile) {
-                AbstractFile file = (AbstractFile) hit.getContent();
+            if (content instanceof AbstractFile) {
+                AbstractFile file = (AbstractFile) content;
                 if (file.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.UNUSED_BLOCKS
                         || file.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.UNALLOC_BLOCKS) {
                     attributes.add(new BlackboardAttribute(KEYWORD_SEARCH_DOCUMENT_ID, MODULE_NAME, hit.getSolrDocumentId()));
@@ -422,7 +429,7 @@ final class TermsComponentQuery implements KeywordSearchQuery {
              * Create an account artifact.
              */
             try {
-                newArtifact = hit.getContent().newArtifact(ARTIFACT_TYPE.TSK_ACCOUNT);
+                newArtifact = content.newArtifact(ARTIFACT_TYPE.TSK_ACCOUNT);
             } catch (TskCoreException ex) {
                 LOGGER.log(Level.SEVERE, "Error adding artifact for account to blackboard", ex); //NON-NLS
                 return null;
@@ -435,15 +442,17 @@ final class TermsComponentQuery implements KeywordSearchQuery {
         if (snippet != null) {
             attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_KEYWORD_PREVIEW, MODULE_NAME, snippet));
         }
-        if (hit.isArtifactHit()) {
-            attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_ASSOCIATED_ARTIFACT, MODULE_NAME, hit.getArtifact().getArtifactID()));
-        }
+
+        hit.getArtifactID().ifPresent(
+                artifactID -> attributes.add(new BlackboardAttribute(ATTRIBUTE_TYPE.TSK_ASSOCIATED_ARTIFACT, MODULE_NAME, artifactID))
+        );
+
+        // TermsComponentQuery is now being used exclusively for substring searches.
+        attributes.add(new BlackboardAttribute(BlackboardAttribute.ATTRIBUTE_TYPE.TSK_KEYWORD_SEARCH_TYPE, MODULE_NAME, KeywordSearch.QueryType.SUBSTRING.ordinal()));
 
         try {
             newArtifact.addAttributes(attributes);
-            KeywordCachedArtifact writeResult = new KeywordCachedArtifact(newArtifact);
-            writeResult.add(attributes);
-            return writeResult;
+            return newArtifact;
         } catch (TskCoreException e) {
             LOGGER.log(Level.SEVERE, "Error adding bb attributes for terms search artifact", e); //NON-NLS
             return null;
@@ -471,9 +480,9 @@ final class TermsComponentQuery implements KeywordSearchQuery {
      * hit and turns them into artifact attributes. The track 1 data has the
      * same fields as the track two data, plus the account holder's name.
      *
-     * @param attributesMap A map of artifact attribute objects, used to avoid
-     *                      creating duplicate attributes.
-     * @param matcher       A matcher for the snippet.
+     * @param attributeMap A map of artifact attribute objects, used to avoid
+     *                     creating duplicate attributes.
+     * @param matcher      A matcher for the snippet.
      */
     static private void parseTrack1Data(Map<BlackboardAttribute.Type, BlackboardAttribute> attributeMap, Matcher matcher) {
         parseTrack2Data(attributeMap, matcher);
@@ -484,12 +493,12 @@ final class TermsComponentQuery implements KeywordSearchQuery {
      * Creates an attribute of the the given type to the given artifact with a
      * value parsed from the snippet for a credit account number hit.
      *
-     * @param attributesMap A map of artifact attribute objects, used to avoid
-     *                      creating duplicate attributes.
-     * @param attrType      The type of attribute to create.
-     * @param groupName     The group name of the regular expression that was
-     *                      used to parse the attribute data.
-     * @param matcher       A matcher for the snippet.
+     * @param attributeMap A map of artifact attribute objects, used to avoid
+     *                     creating duplicate attributes.
+     * @param attrType     The type of attribute to create.
+     * @param groupName    The group name of the regular expression that was
+     *                     used to parse the attribute data.
+     * @param matcher      A matcher for the snippet.
      */
     static private void addAttributeIfNotAlreadyCaptured(Map<BlackboardAttribute.Type, BlackboardAttribute> attributeMap, ATTRIBUTE_TYPE attrType, String groupName, Matcher matcher) {
         BlackboardAttribute.Type type = new BlackboardAttribute.Type(attrType);

@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011-2016 Basis Technology Corp.
+ * Copyright 2011-2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,14 +18,20 @@
  */
 package org.sleuthkit.autopsy.casemodule;
 
-import java.awt.Cursor;
 import java.awt.Frame;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
 import java.beans.PropertyChangeListener;
 import java.beans.PropertyChangeSupport;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.text.SimpleDateFormat;
 import java.util.Collection;
 import java.util.Date;
@@ -33,18 +39,33 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.MissingResourceException;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.annotation.concurrent.GuardedBy;
+import javax.annotation.concurrent.ThreadSafe;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
+import org.openide.util.Lookup;
 import org.openide.util.NbBundle;
 import org.openide.util.NbBundle.Messages;
 import org.openide.util.actions.CallableSystemAction;
 import org.openide.windows.WindowManager;
+import org.sleuthkit.autopsy.actions.OpenOutputFolderAction;
+import org.sleuthkit.autopsy.appservices.AutopsyService;
+import org.sleuthkit.autopsy.appservices.AutopsyService.CaseContext;
+import static org.sleuthkit.autopsy.casemodule.Bundle.*;
 import org.sleuthkit.autopsy.casemodule.CaseMetadata.CaseMetadataException;
 import org.sleuthkit.autopsy.casemodule.events.AddingDataSourceEvent;
 import org.sleuthkit.autopsy.casemodule.events.AddingDataSourceFailedEvent;
@@ -55,6 +76,10 @@ import org.sleuthkit.autopsy.casemodule.events.ContentTagDeletedEvent;
 import org.sleuthkit.autopsy.casemodule.events.DataSourceAddedEvent;
 import org.sleuthkit.autopsy.casemodule.events.ReportAddedEvent;
 import org.sleuthkit.autopsy.casemodule.services.Services;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService.CategoryNode;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService.CoordinationServiceException;
+import org.sleuthkit.autopsy.coordinationservice.CoordinationService.Lock;
 import org.sleuthkit.autopsy.core.RuntimeProperties;
 import org.sleuthkit.autopsy.core.UserPreferences;
 import org.sleuthkit.autopsy.core.UserPreferencesException;
@@ -65,6 +90,7 @@ import org.sleuthkit.autopsy.coreutils.Logger;
 import org.sleuthkit.autopsy.coreutils.MessageNotifyUtil;
 import org.sleuthkit.autopsy.coreutils.NetworkUtils;
 import org.sleuthkit.autopsy.coreutils.PlatformUtil;
+import org.sleuthkit.autopsy.coreutils.ThreadUtils;
 import org.sleuthkit.autopsy.coreutils.TimeZoneUtils;
 import org.sleuthkit.autopsy.coreutils.Version;
 import org.sleuthkit.autopsy.events.AutopsyEvent;
@@ -72,25 +98,69 @@ import org.sleuthkit.autopsy.events.AutopsyEventException;
 import org.sleuthkit.autopsy.events.AutopsyEventPublisher;
 import org.sleuthkit.autopsy.ingest.IngestJob;
 import org.sleuthkit.autopsy.ingest.IngestManager;
+import org.sleuthkit.autopsy.keywordsearchservice.KeywordSearchService;
+import org.sleuthkit.autopsy.keywordsearchservice.KeywordSearchServiceException;
+import org.sleuthkit.autopsy.progress.LoggingProgressIndicator;
+import org.sleuthkit.autopsy.progress.ModalDialogProgressIndicator;
+import org.sleuthkit.autopsy.progress.ProgressIndicator;
 import org.sleuthkit.autopsy.timeline.OpenTimelineAction;
 import org.sleuthkit.datamodel.BlackboardArtifactTag;
+import org.sleuthkit.datamodel.CaseDbConnectionInfo;
 import org.sleuthkit.datamodel.Content;
 import org.sleuthkit.datamodel.ContentTag;
 import org.sleuthkit.datamodel.Image;
 import org.sleuthkit.datamodel.Report;
 import org.sleuthkit.datamodel.SleuthkitCase;
 import org.sleuthkit.datamodel.TskCoreException;
-import org.sleuthkit.datamodel.TskException;
+import org.sleuthkit.datamodel.TskUnsupportedSchemaVersionException;
 
 /**
  * An Autopsy case. Currently, only one case at a time may be open.
  */
-public class Case implements SleuthkitCase.ErrorObserver {
+public class Case {
+
+    private static final int DIR_LOCK_TIMOUT_HOURS = 12;
+    private static final int RESOURCES_LOCK_TIMOUT_HOURS = 12;
+    private static final String SINGLE_USER_CASE_DB_NAME = "autopsy.db";
+    private static final String EVENT_CHANNEL_NAME = "%s-Case-Events"; //NON-NLS
+    private static final String CACHE_FOLDER = "Cache"; //NON-NLS
+    private static final String EXPORT_FOLDER = "Export"; //NON-NLS
+    private static final String LOG_FOLDER = "Log"; //NON-NLS
+    private static final String REPORTS_FOLDER = "Reports"; //NON-NLS
+    private static final String TEMP_FOLDER = "Temp"; //NON-NLS
+    private static final String MODULE_FOLDER = "ModuleOutput"; //NON-NLS
+    private static final String CASE_ACTION_THREAD_NAME = "%s-case-action";
+    private static final String CASE_RESOURCES_THREAD_NAME = "%s-manage-case-resources";
+    private static final Logger logger = Logger.getLogger(Case.class.getName());
+    private static final AutopsyEventPublisher eventPublisher = new AutopsyEventPublisher();
+    private static final Object caseActionSerializationLock = new Object();
+    private static volatile Frame mainFrame;
+    private static volatile Case currentCase;
+    private final CaseMetadata metadata;
+    private volatile ExecutorService caseLockingExecutor;
+    private CoordinationService.Lock caseDirLock;
+    private SleuthkitCase caseDb;
+    private CollaborationMonitor collaborationMonitor;
+    private Services caseServices;
+    private boolean hasDataSources;
+
+    /*
+     * Get a reference to the main window of the desktop application to use to
+     * parent pop up dialogs and initialize the application name for use in
+     * changing the main window title.
+     */
+    static {
+        WindowManager.getDefault().invokeWhenUIReady(new Runnable() {
+            @Override
+            public void run() {
+                mainFrame = WindowManager.getDefault().getMainWindow();
+            }
+        });
+    }
 
     /**
      * An enumeration of case types.
      */
-    @NbBundle.Messages({"Case_caseType_singleUser=Single-user case", "Case_caseType_multiUser=Multi-user case"})
     public enum CaseType {
 
         SINGLE_USER_CASE("Single-user case"), //NON-NLS
@@ -99,12 +169,21 @@ public class Case implements SleuthkitCase.ErrorObserver {
         private final String typeName;
 
         /**
-         * Constructs a case type.
+         * Gets a case type from a case type name string.
          *
-         * @param typeName The type name.
+         * @param typeName The case type name string.
+         *
+         * @return
          */
-        private CaseType(String typeName) {
-            this.typeName = typeName;
+        public static CaseType fromString(String typeName) {
+            if (typeName != null) {
+                for (CaseType c : CaseType.values()) {
+                    if (typeName.equalsIgnoreCase(c.toString())) {
+                        return c;
+                    }
+                }
+            }
+            return null;
         }
 
         /**
@@ -120,8 +199,12 @@ public class Case implements SleuthkitCase.ErrorObserver {
         /**
          * Gets the localized display name for this case type.
          *
-         * @return The dis[play name.
+         * @return The display name.
          */
+        @Messages({
+            "Case_caseType_singleUser=Single-user case",
+            "Case_caseType_multiUser=Multi-user case"
+        })
         String getLocalizedDisplayName() {
             if (fromString(typeName) == SINGLE_USER_CASE) {
                 return Bundle.Case_caseType_singleUser();
@@ -131,30 +214,21 @@ public class Case implements SleuthkitCase.ErrorObserver {
         }
 
         /**
-         * Gets a case type from a case type name string
+         * Constructs a case type.
          *
-         * @param typeName The case type name string.
-         *
-         * @return
+         * @param typeName The type name.
          */
-        public static CaseType fromString(String typeName) {
-            if (typeName != null) {
-                for (CaseType c : CaseType.values()) {
-                    if (typeName.equalsIgnoreCase(c.typeName)) {
-                        return c;
-                    }
-                }
-            }
-            return null;
+        private CaseType(String typeName) {
+            this.typeName = typeName;
         }
 
         /**
-         * Tests the equality of the type name of this case type with a case
-         * type name.
+         * Tests the equality of the type name of this case type with another
+         * case type name.
          *
-         * @param otherTypeName A case type name
+         * @param otherTypeName A case type name,
          *
-         * @return True or false
+         * @return True or false,
          *
          * @deprecated Do not use.
          */
@@ -166,8 +240,8 @@ public class Case implements SleuthkitCase.ErrorObserver {
     };
 
     /**
-     * An enumeration of events (property change events) a case may publish
-     * (fire).
+     * An enumeration of the case events (property change events) a case may
+     * publish (fire).
      */
     public enum Events {
 
@@ -175,26 +249,35 @@ public class Case implements SleuthkitCase.ErrorObserver {
          * The name of the current case has changed. The old value of the
          * PropertyChangeEvent is the old case name (type: String), the new
          * value is the new case name (type: String).
+         *
+         * @Deprecated CASE_DETAILS event should be used instead
          */
+        @Deprecated
         NAME,
         /**
          * The number of the current case has changed. The old value of the
-         * PropertyChangeEvent is the old number (type: String), the new value
-         * is the new case number (type: String).
+         * PropertyChangeEvent is the old case number (type: String), the new
+         * value is the new case number (type: String).
+         *
+         * @Deprecated CASE_DETAILS event should be used instead
          */
+        @Deprecated
         NUMBER,
         /**
          * The examiner associated with the current case has changed. The old
          * value of the PropertyChangeEvent is the old examiner (type: String),
          * the new value is the new examiner (type: String).
+         *
+         * @Deprecated CASE_DETAILS event should be used instead
          */
+        @Deprecated
         EXAMINER,
         /**
          * An attempt to add a new data source to the current case is being
          * made. The old and new values of the PropertyChangeEvent are null.
          * Cast the PropertyChangeEvent to
          * org.sleuthkit.autopsy.casemodule.events.AddingDataSourceEvent to
-         * access event data.
+         * access additional event data.
          */
         ADDING_DATA_SOURCE,
         /**
@@ -202,7 +285,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
          * The old and new values of the PropertyChangeEvent are null. Cast the
          * PropertyChangeEvent to
          * org.sleuthkit.autopsy.casemodule.events.AddingDataSourceFailedEvent
-         * to access event data.
+         * to access additional event data.
          */
         ADDING_DATA_SOURCE_FAILED,
         /**
@@ -210,7 +293,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
          * of the PropertyChangeEvent is null, the new value is the newly-added
          * data source (type: Content). Cast the PropertyChangeEvent to
          * org.sleuthkit.autopsy.casemodule.events.DataSourceAddedEvent to
-         * access event data.
+         * access additional event data.
          */
         DATA_SOURCE_ADDED,
         /**
@@ -220,11 +303,20 @@ public class Case implements SleuthkitCase.ErrorObserver {
          */
         DATA_SOURCE_DELETED,
         /**
-         * The current case has changed. If a case has been opened, the old
-         * value of the PropertyChangeEvent is null, the new value is the new
-         * case (type: Case). If a case has been closed, the old value of the
-         * PropertyChangeEvent is the closed case (type: Case), the new value is
-         * null.
+         * The current case has changed.
+         *
+         * If a new case has been opened as the current case, the old value of
+         * the PropertyChangeEvent is null, and the new value is the new case
+         * (type: Case).
+         *
+         * If the current case has been closed, the old value of the
+         * PropertyChangeEvent is the closed case (type: Case), and the new
+         * value is null. IMPORTANT: Subscribers to this event should not call
+         * isCaseOpen or getCurrentCase in the interval between a case closed
+         * event and a case opened event. If there is any need for upon closing
+         * interaction with a closed case, the case in the old value should be
+         * used, and it should be done synchronously in the CURRENT_CASE event
+         * handler.
          */
         CURRENT_CASE,
         /**
@@ -234,7 +326,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
          */
         REPORT_ADDED,
         /**
-         * A report has been added to the current case. The old value of the
+         * A report has been deleted from the current case. The old value of the
          * PropertyChangeEvent is the report (type: Report), the new value is
          * null.
          */
@@ -247,8 +339,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
         BLACKBOARD_ARTIFACT_TAG_ADDED,
         /**
          * A tag has been removed from an artifact associated with the current
-         * case. The old value of the PropertyChangeEvent is is the tag info
-         * (type:
+         * case. The old value of the PropertyChangeEvent is the tag info (type:
          * BlackBoardArtifactTagDeletedEvent.DeletedBlackboardArtifactTagInfo),
          * the new value is null.
          */
@@ -264,38 +355,22 @@ public class Case implements SleuthkitCase.ErrorObserver {
          * The old value of the PropertyChangeEvent is is the tag info (type:
          * ContentTagDeletedEvent.DeletedContentTagInfo), the new value is null.
          */
-        CONTENT_TAG_DELETED;
+        CONTENT_TAG_DELETED,
+        /**
+         * The case display name or an optional detail which can be provided
+         * regarding a case has been changed. The optional details include the
+         * case number, the examiner name, examiner phone, examiner email, and
+         * the case notes.
+         */
+        CASE_DETAILS,
+        /**
+         * A tag definition has changed (e.g., description, known status). The
+         * old value of the PropertyChangeEvent is the display name of the tag
+         * definition that has changed.
+         */
+        TAG_DEFINITION_CHANGED;
+
     };
-
-    private static final int MAX_SANITIZED_CASE_NAME_LEN = 47;
-    private static final String EVENT_CHANNEL_NAME = "%s-Case-Events"; //NON-NLS
-    private static final String CACHE_FOLDER = "Cache"; //NON-NLS
-    private static final String EXPORT_FOLDER = "Export"; //NON-NLS
-    private static final String LOG_FOLDER = "Log"; //NON-NLS
-    private static final String REPORTS_FOLDER = "Reports"; //NON-NLS
-    private static final String TEMP_FOLDER = "Temp"; //NON-NLS
-    static final String MODULE_FOLDER = "ModuleOutput"; //NON-NLS
-    private static final int MIN_SECS_BETWEEN_TSK_ERROR_REPORTS = 60;
-    private static final Logger logger = Logger.getLogger(Case.class.getName());
-    private static final AutopsyEventPublisher eventPublisher = new AutopsyEventPublisher();
-    private static String appName;
-    private static Case currentCase;
-    private final CaseMetadata caseMetadata;
-    private final SleuthkitCase db;
-    private final Services services;
-    private CollaborationMonitor collaborationMonitor;
-    private boolean hasDataSources;
-    private volatile IntervalErrorReportData tskErrorReporter;
-
-    /**
-     * Constructs an Autopsy case. Currently, only one case at a time may be
-     * open.
-     */
-    private Case(CaseMetadata caseMetadata, SleuthkitCase db) {
-        this.caseMetadata = caseMetadata;
-        this.db = db;
-        this.services = new Services(db);
-    }
 
     /**
      * Adds a subscriber to all case events. To subscribe to only specific
@@ -326,7 +401,10 @@ public class Case implements SleuthkitCase.ErrorObserver {
      *
      * @param eventNames The events the subscriber is interested in.
      * @param subscriber The subscriber (PropertyChangeListener) to add.
+     *
+     * @deprecated Use addEventTypeSubscriber instead.
      */
+    @Deprecated
     public static void addEventSubscriber(Set<String> eventNames, PropertyChangeListener subscriber) {
         eventPublisher.addSubscriber(eventNames, subscriber);
     }
@@ -334,9 +412,24 @@ public class Case implements SleuthkitCase.ErrorObserver {
     /**
      * Adds a subscriber to specific case events.
      *
-     * @param eventName  The event the subscriber is interested in.
+     * @param eventTypes The events the subscriber is interested in.
      * @param subscriber The subscriber (PropertyChangeListener) to add.
      */
+    public static void addEventTypeSubscriber(Set<Events> eventTypes, PropertyChangeListener subscriber) {
+        eventTypes.forEach((Events event) -> {
+            eventPublisher.addSubscriber(event.toString(), subscriber);
+        });
+    }
+
+    /**
+     * Adds a subscriber to specific case events.
+     *
+     * @param eventName  The event the subscriber is interested in.
+     * @param subscriber The subscriber (PropertyChangeListener) to add.
+     *
+     * @deprecated Use addEventTypeSubscriber instead.
+     */
+    @Deprecated
     public static void addEventSubscriber(String eventName, PropertyChangeListener subscriber) {
         eventPublisher.addSubscriber(eventName, subscriber);
     }
@@ -362,7 +455,125 @@ public class Case implements SleuthkitCase.ErrorObserver {
     }
 
     /**
-     * Checks if case is currently open.
+     * Removes a subscriber to specific case events.
+     *
+     * @param eventTypes The events the subscriber is no longer interested in.
+     * @param subscriber The subscriber (PropertyChangeListener) to remove.
+     */
+    public static void removeEventTypeSubscriber(Set<Events> eventTypes, PropertyChangeListener subscriber) {
+        eventTypes.forEach((Events event) -> {
+            eventPublisher.removeSubscriber(event.toString(), subscriber);
+        });
+    }
+
+    /**
+     * Checks if a case display name is valid, i.e., does not include any
+     * characters that cannot be used in file names.
+     *
+     * @param caseName The candidate case name.
+     *
+     * @return True or false.
+     */
+    public static boolean isValidName(String caseName) {
+        return !(caseName.contains("\\") || caseName.contains("/") || caseName.contains(":")
+                || caseName.contains("*") || caseName.contains("?") || caseName.contains("\"")
+                || caseName.contains("<") || caseName.contains(">") || caseName.contains("|"));
+    }
+
+    /**
+     * Creates a new case and makes it the current case.
+     *
+     * IMPORTANT: This method should not be called in the event dispatch thread
+     * (EDT).
+     *
+     * @param caseDir         The full path of the case directory. The directory
+     *                        will be created if it doesn't already exist; if it
+     *                        exists, it is ASSUMED it was created by calling
+     *                        createCaseDirectory.
+     * @param caseDisplayName The display name of case, which may be changed
+     *                        later by the user.
+     * @param caseNumber      The case number, can be the empty string.
+     * @param examiner        The examiner to associate with the case, can be
+     *                        the empty string.
+     * @param caseType        The type of case (single-user or multi-user).
+     *
+     * @throws CaseActionException          If there is a problem creating the
+     *                                      case.
+     * @throws CaseActionCancelledException If creating the case is cancelled.
+     *
+     * @Deprecated use createAsCurrentCase(CaseType caseType, String caseDir,
+     * CaseDetails caseDetails) instead
+     */
+    @Deprecated
+    public static void createAsCurrentCase(String caseDir, String caseDisplayName, String caseNumber, String examiner, CaseType caseType) throws CaseActionException, CaseActionCancelledException {
+        createAsCurrentCase(caseType, caseDir, new CaseDetails(caseDisplayName, caseNumber, examiner, "", "", ""));
+    }
+
+    /**
+     * Creates a new case and makes it the current case.
+     *
+     * IMPORTANT: This method should not be called in the event dispatch thread
+     * (EDT).
+     *
+     * @param caseDir     The full path of the case directory. The directory
+     *                    will be created if it doesn't already exist; if it
+     *                    exists, it is ASSUMED it was created by calling
+     *                    createCaseDirectory.
+     * @param caseType    The type of case (single-user or multi-user).
+     * @param caseDetails Contains the modifiable details of the case such as
+     *                    the case display name, the case number, and the
+     *                    examiner related data.
+     *
+     * @throws CaseActionException          If there is a problem creating the
+     *                                      case.
+     * @throws CaseActionCancelledException If creating the case is cancelled.
+     */
+    @Messages({
+        "Case.exceptionMessage.emptyCaseName=Must specify a case name.",
+        "Case.exceptionMessage.emptyCaseDir=Must specify a case directory path."
+    })
+    public static void createAsCurrentCase(CaseType caseType, String caseDir, CaseDetails caseDetails) throws CaseActionException, CaseActionCancelledException {
+        if (caseDetails.getCaseDisplayName().isEmpty()) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_emptyCaseName());
+        }
+        if (caseDir.isEmpty()) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_emptyCaseDir());
+        }
+        openAsCurrentCase(new Case(caseType, caseDir, caseDetails), true);
+    }
+
+    /**
+     * Opens an existing case and makes it the current case.
+     *
+     * IMPORTANT: This method should not be called in the event dispatch thread
+     * (EDT).
+     *
+     * @param caseMetadataFilePath The path of the case metadata (.aut) file.
+     *
+     * @throws CaseActionException If there is a problem opening the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     */
+    @Messages({
+        "Case.exceptionMessage.failedToReadMetadata=Failed to read case metadata.",
+        "Case.exceptionMessage.cannotOpenMultiUserCaseNoSettings=Multi-user settings are missing (see Tools, Options, Multi-user tab), cannot open a multi-user case."
+    })
+    public static void openAsCurrentCase(String caseMetadataFilePath) throws CaseActionException {
+        CaseMetadata metadata;
+        try {
+            metadata = new CaseMetadata(Paths.get(caseMetadataFilePath));
+        } catch (CaseMetadataException ex) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_failedToReadMetadata(), ex);
+        }
+        if (CaseType.MULTI_USER_CASE == metadata.getCaseType() && !UserPreferences.getIsMultiUserModeEnabled()) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_cannotOpenMultiUserCaseNoSettings());
+        }
+        openAsCurrentCase(new Case(metadata), false);
+    }
+
+    /**
+     * Checks if a case, the current case, is open at the time it is called.
      *
      * @return True or false.
      */
@@ -371,17 +582,566 @@ public class Case implements SleuthkitCase.ErrorObserver {
     }
 
     /**
-     * Gets the current case, if there is one.
+     * Gets the current case, if there is one, at the time of the call.
      *
      * @return The current case.
      *
      * @throws IllegalStateException if there is no current case.
      */
     public static Case getCurrentCase() {
-        if (currentCase != null) {
+        /*
+         * Throwing an unchecked exception is a bad idea here.
+         *
+         * TODO (JIRA-2229): Case.getCurrentCase() method throws unchecked
+         * IllegalStateException; change to throw checked exception or return
+         * null
+         */
+        if (null != currentCase) {
             return currentCase;
         } else {
             throw new IllegalStateException(NbBundle.getMessage(Case.class, "Case.getCurCase.exception.noneOpen"));
+        }
+    }
+
+    /**
+     * Closes the current case.
+     *
+     * @throws CaseActionException If there is a problem closing the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     */
+    @Messages({
+        "# {0} - exception message", "Case.closeException.couldNotCloseCase=Error closing case: {0}",
+        "Case.progressIndicatorTitle.closingCase=Closing Case"
+    })
+    public static void closeCurrentCase() throws CaseActionException {
+        synchronized (caseActionSerializationLock) {
+            if (null == currentCase) {
+                return;
+            }
+            Case closedCase = currentCase;
+            try {
+                eventPublisher.publishLocally(new AutopsyEvent(Events.CURRENT_CASE.toString(), closedCase, null));
+                logger.log(Level.INFO, "Closing current case {0} ({1}) in {2}", new Object[]{closedCase.getDisplayName(), closedCase.getName(), closedCase.getCaseDirectory()}); //NON-NLS
+                currentCase = null;
+                closedCase.close();
+                logger.log(Level.INFO, "Closed current case {0} ({1}) in {2}", new Object[]{closedCase.getDisplayName(), closedCase.getName(), closedCase.getCaseDirectory()}); //NON-NLS
+            } catch (CaseActionException ex) {
+                logger.log(Level.SEVERE, String.format("Error closing current case %s (%s) in %s", closedCase.getDisplayName(), closedCase.getName(), closedCase.getCaseDirectory()), ex); //NON-NLS                
+                throw ex;
+            } finally {
+                if (RuntimeProperties.runningWithGUI()) {
+                    updateGUIForCaseClosed();
+                }
+            }
+        }
+    }
+
+    /**
+     * Deletes the current case.
+     *
+     * @throws CaseActionException If there is a problem deleting the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     */
+    public static void deleteCurrentCase() throws CaseActionException {
+        synchronized (caseActionSerializationLock) {
+            if (null == currentCase) {
+                return;
+            }
+            CaseMetadata metadata = currentCase.getMetadata();
+            closeCurrentCase();
+            deleteCase(metadata);
+        }
+    }
+
+    /**
+     * Deletes a case. This method cannot be used to delete the current case;
+     * deleting the current case must be done by calling Case.deleteCurrentCase.
+     *
+     * @param metadata The metadata for the case to delete.
+     *
+     * @throws CaseActionException if there is a problem deleting the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     */
+    @Messages({
+        "Case.progressIndicatorTitle.deletingCase=Deleting Case",
+        "Case.exceptionMessage.cannotDeleteCurrentCase=Cannot delete current case, it must be closed first.",
+        "Case.progressMessage.checkingForOtherUser=Checking to see if another user has the case open...",
+        "Case.exceptionMessage.cannotGetLockToDeleteCase=Cannot delete case because it is open for another user or there is a problem with the coordination service."
+    })
+    public static void deleteCase(CaseMetadata metadata) throws CaseActionException {
+        synchronized (caseActionSerializationLock) {
+            if (null != currentCase) {
+                throw new CaseActionException(Bundle.Case_exceptionMessage_cannotDeleteCurrentCase());
+            }
+        }
+
+        /*
+         * Set up either a GUI progress indicator without a cancel button (can't
+         * cancel deleting a case) or a logging progress indicator.
+         */
+        ProgressIndicator progressIndicator;
+        if (RuntimeProperties.runningWithGUI()) {
+            progressIndicator = new ModalDialogProgressIndicator(mainFrame, Bundle.Case_progressIndicatorTitle_deletingCase());
+        } else {
+            progressIndicator = new LoggingProgressIndicator();
+        }
+        progressIndicator.start(Bundle.Case_progressMessage_preparing());
+        try {
+            if (CaseType.SINGLE_USER_CASE == metadata.getCaseType()) {
+                deleteCase(metadata, progressIndicator);
+            } else {
+                /*
+                 * First, acquire an exclusive case directory lock. The case
+                 * cannot be deleted if another node has it open.
+                 */
+                progressIndicator.progress(Bundle.Case_progressMessage_checkingForOtherUser());
+                try (CoordinationService.Lock dirLock = CoordinationService.getInstance().tryGetExclusiveLock(CategoryNode.CASES, metadata.getCaseDirectory())) {
+                    assert (null != dirLock);
+                    deleteCase(metadata, progressIndicator);
+                } catch (CoordinationServiceException ex) {
+                    throw new CaseActionException(Bundle.Case_exceptionMessage_cannotGetLockToDeleteCase(), ex);
+                }
+            }
+        } finally {
+            progressIndicator.finish();
+        }
+    }
+
+    /**
+     * Opens a new or existing case as the current case.
+     *
+     * @param newCurrentCase The case.
+     * @param isNewCase      True for a new case, false otherwise.
+     *
+     * @throws CaseActionException          If there is a problem creating the
+     *                                      case.
+     * @throws CaseActionCancelledException If creating the case is cancelled.
+     */
+    @Messages({
+        "Case.exceptionMessage.cannotLocateMainWindow=Cannot locate main application window"
+    })
+    private static void openAsCurrentCase(Case newCurrentCase, boolean isNewCase) throws CaseActionException, CaseActionCancelledException {
+        synchronized (caseActionSerializationLock) {
+            if (null != currentCase) {
+                try {
+                    closeCurrentCase();
+                } catch (CaseActionException ex) {
+                    /*
+                     * Notify the user and continue (the error has already been
+                     * logged in closeCurrentCase.
+                     */
+                    MessageNotifyUtil.Message.error(ex.getLocalizedMessage());
+                }
+            }
+            try {
+                logger.log(Level.INFO, "Opening {0} ({1}) in {2} as the current case", new Object[]{newCurrentCase.getDisplayName(), newCurrentCase.getName(), newCurrentCase.getCaseDirectory()}); //NON-NLS
+                newCurrentCase.open(isNewCase);
+                currentCase = newCurrentCase;
+                logger.log(Level.INFO, "Opened {0} ({1}) in {2} as the current case", new Object[]{newCurrentCase.getDisplayName(), newCurrentCase.getName(), newCurrentCase.getCaseDirectory()}); //NON-NLS
+                if (RuntimeProperties.runningWithGUI()) {
+                    updateGUIForCaseOpened(newCurrentCase);
+                }
+                eventPublisher.publishLocally(new AutopsyEvent(Events.CURRENT_CASE.toString(), null, currentCase));
+            } catch (CaseActionCancelledException ex) {
+                logger.log(Level.INFO, String.format("Cancelled opening %s (%s) in %s as the current case", newCurrentCase.getDisplayName(), newCurrentCase.getName(), newCurrentCase.getCaseDirectory())); //NON-NLS                
+                throw ex;
+            } catch (CaseActionException ex) {
+                logger.log(Level.SEVERE, String.format("Error opening %s (%s) in %s as the current case", newCurrentCase.getDisplayName(), newCurrentCase.getName(), newCurrentCase.getCaseDirectory()), ex); //NON-NLS                
+                throw ex;
+            }
+        }
+    }
+
+    /**
+     * Transforms a case display name into a unique case name that can be used
+     * to identify the case even if the display name is changed.
+     *
+     * @param caseDisplayName A case display name.
+     *
+     * @return The unique case name.
+     */
+    private static String displayNameToUniqueName(String caseDisplayName) {
+        /*
+         * Replace all non-ASCII characters.
+         */
+        String uniqueCaseName = caseDisplayName.replaceAll("[^\\p{ASCII}]", "_"); //NON-NLS
+
+        /*
+         * Replace all control characters.
+         */
+        uniqueCaseName = uniqueCaseName.replaceAll("[\\p{Cntrl}]", "_"); //NON-NLS
+
+        /*
+         * Replace /, \, :, ?, space, ' ".
+         */
+        uniqueCaseName = uniqueCaseName.replaceAll("[ /?:'\"\\\\]", "_"); //NON-NLS
+
+        /*
+         * Make it all lowercase.
+         */
+        uniqueCaseName = uniqueCaseName.toLowerCase();
+
+        /*
+         * Add a time stamp for uniqueness.
+         */
+        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMdd_HHmmss");
+        Date date = new Date();
+        uniqueCaseName = uniqueCaseName + "_" + dateFormat.format(date);
+
+        return uniqueCaseName;
+    }
+
+    /**
+     * Creates a case directory and its subdirectories.
+     *
+     * @param caseDir  Path to the case directory (typically base + case name).
+     * @param caseType The type of case, single-user or multi-user.
+     *
+     * @throws CaseActionException throw if could not create the case dir
+     */
+    static void createCaseDirectory(String caseDir, CaseType caseType) throws CaseActionException {
+
+        File caseDirF = new File(caseDir);
+
+        if (caseDirF.exists()) {
+            if (caseDirF.isFile()) {
+                throw new CaseActionException(
+                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.existNotDir", caseDir));
+
+            } else if (!caseDirF.canRead() || !caseDirF.canWrite()) {
+                throw new CaseActionException(
+                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.existCantRW", caseDir));
+            }
+        }
+
+        try {
+            boolean result = (caseDirF).mkdirs(); // create root case Directory
+
+            if (result == false) {
+                throw new CaseActionException(
+                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreate", caseDir));
+            }
+
+            // create the folders inside the case directory
+            String hostClause = "";
+
+            if (caseType == CaseType.MULTI_USER_CASE) {
+                hostClause = File.separator + NetworkUtils.getLocalHostName();
+            }
+            result = result && (new File(caseDir + hostClause + File.separator + EXPORT_FOLDER)).mkdirs()
+                    && (new File(caseDir + hostClause + File.separator + LOG_FOLDER)).mkdirs()
+                    && (new File(caseDir + hostClause + File.separator + TEMP_FOLDER)).mkdirs()
+                    && (new File(caseDir + hostClause + File.separator + CACHE_FOLDER)).mkdirs();
+
+            if (result == false) {
+                throw new CaseActionException(
+                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreateCaseDir", caseDir));
+            }
+
+            final String modulesOutDir = caseDir + hostClause + File.separator + MODULE_FOLDER;
+            result = new File(modulesOutDir).mkdir();
+
+            if (result == false) {
+                throw new CaseActionException(
+                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreateModDir",
+                                modulesOutDir));
+            }
+
+            final String reportsOutDir = caseDir + hostClause + File.separator + REPORTS_FOLDER;
+            result = new File(reportsOutDir).mkdir();
+
+            if (result == false) {
+                throw new CaseActionException(
+                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreateReportsDir",
+                                modulesOutDir));
+
+            }
+
+        } catch (MissingResourceException | CaseActionException e) {
+            throw new CaseActionException(
+                    NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.gen", caseDir), e);
+        }
+    }
+
+    /**
+     * Gets the paths of data sources that are images.
+     *
+     * @param db A case database.
+     *
+     * @return A mapping of object ids to image paths.
+     */
+    static Map<Long, String> getImagePaths(SleuthkitCase db) {
+        Map<Long, String> imgPaths = new HashMap<>();
+        try {
+            Map<Long, List<String>> imgPathsList = db.getImagePaths();
+            for (Map.Entry<Long, List<String>> entry : imgPathsList.entrySet()) {
+                if (entry.getValue().size() > 0) {
+                    imgPaths.put(entry.getKey(), entry.getValue().get(0));
+                }
+            }
+        } catch (TskCoreException ex) {
+            logger.log(Level.SEVERE, "Error getting image paths", ex); //NON-NLS
+        }
+        return imgPaths;
+    }
+
+    /**
+     *
+     * Deletes the case directory of a deleted case and removes the case form
+     * the Recent Cases menu.
+     *
+     * @param metadata          The case metadata.
+     * @param progressIndicator A progress indicator.
+     *
+     * @throws UserPreferencesException if there is a problem getting the case
+     *                                  databse connection info for a multi-user
+     *                                  case.
+     * @throws ClassNotFoundException   if there is a problem loading the JDBC
+     *                                  driver for PostgreSQL for a multi-user
+     *                                  case.
+     * @throws SQLException             If there is a problem
+     */
+    @Messages({
+        "Case.progressMessage.deletingTextIndex=Deleting text index...",
+        "Case.progressMessage.deletingCaseDatabase=Deleting case database...",
+        "Case.progressMessage.deletingCaseDirectory=Deleting case directory...",
+        "Case.exceptionMessage.errorsDeletingCase=Errors occured while deleting the case. See the application log for details"
+    })
+    private static void deleteCase(CaseMetadata metadata, ProgressIndicator progressIndicator) throws CaseActionException {
+        boolean errorsOccurred = false;
+        if (CaseType.MULTI_USER_CASE == metadata.getCaseType()) {
+            /*
+             * Delete the case database from the database server.
+             */
+            try {
+                progressIndicator.progress(Bundle.Case_progressMessage_deletingCaseDatabase());
+                CaseDbConnectionInfo db;
+                db = UserPreferences.getDatabaseConnectionInfo();
+                Class.forName("org.postgresql.Driver"); //NON-NLS
+                try (Connection connection = DriverManager.getConnection("jdbc:postgresql://" + db.getHost() + ":" + db.getPort() + "/postgres", db.getUserName(), db.getPassword()); //NON-NLS
+                        Statement statement = connection.createStatement();) {
+                    String deleteCommand = "DROP DATABASE \"" + metadata.getCaseDatabaseName() + "\""; //NON-NLS
+                    statement.execute(deleteCommand);
+                }
+            } catch (UserPreferencesException | ClassNotFoundException | SQLException ex) {
+                logger.log(Level.SEVERE, String.format("Failed to delete case database %s for %s (%s) in %s", metadata.getCaseDatabaseName(), metadata.getCaseDisplayName(), metadata.getCaseName(), metadata.getCaseDirectory()), ex);
+                errorsOccurred = true;
+            }
+        }
+
+        /*
+         * Delete the text index.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_deletingTextIndex());
+        for (KeywordSearchService searchService : Lookup.getDefault().lookupAll(KeywordSearchService.class)) {
+            try {
+                searchService.deleteTextIndex(metadata);
+            } catch (KeywordSearchServiceException ex) {
+                logger.log(Level.SEVERE, String.format("Failed to delete text index for %s (%s) in %s", metadata.getCaseDisplayName(), metadata.getCaseName(), metadata.getCaseDirectory()), ex);
+                errorsOccurred = true;
+            }
+        }
+
+        /*
+         * Delete the case directory.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_deletingCaseDirectory());
+        if (!FileUtil.deleteDir(new File(metadata.getCaseDirectory()))) {
+            logger.log(Level.SEVERE, String.format("Failed to delete case directory for %s (%s) in %s", metadata.getCaseDisplayName(), metadata.getCaseName(), metadata.getCaseDirectory()));
+            errorsOccurred = true;
+        }
+
+        /*
+         * If running in a GUI, remove the case from the Recent Cases menu
+         */
+        if (RuntimeProperties.runningWithGUI()) {
+            SwingUtilities.invokeLater(() -> {
+                RecentCases.getInstance().removeRecentCase(metadata.getCaseDisplayName(), metadata.getFilePath().toString());
+            });
+        }
+
+        if (errorsOccurred) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_errorsDeletingCase());
+        }
+    }
+
+    /**
+     * Acquires an exclusive case resources lock.
+     *
+     * @param caseDir The full path of the case directory.
+     *
+     * @return The lock.
+     *
+     * @throws CaseActionException with a user-friendly message if the lock
+     *                             cannot be acquired.
+     */
+    @Messages({"Case.creationException.couldNotAcquireResourcesLock=Failed to get lock on case resources"})
+    private static CoordinationService.Lock acquireExclusiveCaseResourcesLock(String caseDir) throws CaseActionException {
+        try {
+            String resourcesNodeName = caseDir + "_resources";
+            Lock lock = CoordinationService.getInstance().tryGetExclusiveLock(CategoryNode.CASES, resourcesNodeName, RESOURCES_LOCK_TIMOUT_HOURS, TimeUnit.HOURS);
+            if (null == lock) {
+                throw new CaseActionException(Bundle.Case_creationException_couldNotAcquireResourcesLock());
+            }
+            return lock;
+        } catch (InterruptedException ex) {
+            throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+        } catch (CoordinationServiceException ex) {
+            throw new CaseActionException(Bundle.Case_creationException_couldNotAcquireResourcesLock(), ex);
+        }
+    }
+
+    /**
+     * Update the GUI to to reflect the current case.
+     */
+    private static void updateGUIForCaseOpened(Case newCurrentCase) {
+        if (RuntimeProperties.runningWithGUI()) {
+            SwingUtilities.invokeLater(() -> {
+                /*
+                 * If the case database was upgraded for a new schema and a
+                 * backup database was created, notify the user.
+                 */
+                SleuthkitCase caseDb = newCurrentCase.getSleuthkitCase();
+                String backupDbPath = caseDb.getBackupDatabasePath();
+                if (null != backupDbPath) {
+                    JOptionPane.showMessageDialog(
+                            mainFrame,
+                            NbBundle.getMessage(Case.class, "Case.open.msgDlg.updated.msg", backupDbPath),
+                            NbBundle.getMessage(Case.class, "Case.open.msgDlg.updated.title"),
+                            JOptionPane.INFORMATION_MESSAGE);
+                }
+
+                /*
+                 * Look for the files for the data sources listed in the case
+                 * database and give the user the opportunity to locate any that
+                 * are missing.
+                 */
+                Map<Long, String> imgPaths = getImagePaths(caseDb);
+                for (Map.Entry<Long, String> entry : imgPaths.entrySet()) {
+                    long obj_id = entry.getKey();
+                    String path = entry.getValue();
+                    boolean fileExists = (new File(path).isFile() || DriveUtils.driveExists(path));
+                    if (!fileExists) {
+                        int response = JOptionPane.showConfirmDialog(
+                                mainFrame,
+                                NbBundle.getMessage(Case.class, "Case.checkImgExist.confDlg.doesntExist.msg", path),
+                                NbBundle.getMessage(Case.class, "Case.checkImgExist.confDlg.doesntExist.title"),
+                                JOptionPane.YES_NO_OPTION);
+                        if (response == JOptionPane.YES_OPTION) {
+                            MissingImageDialog.makeDialog(obj_id, caseDb);
+                        } else {
+                            logger.log(Level.SEVERE, "User proceeding with missing image files"); //NON-NLS
+
+                        }
+                    }
+                }
+
+                /*
+                 * Enable the case-specific actions.
+                 */
+                CallableSystemAction.get(AddImageAction.class).setEnabled(true);
+                CallableSystemAction.get(CaseCloseAction.class).setEnabled(true);
+                CallableSystemAction.get(CasePropertiesAction.class).setEnabled(true);
+                CallableSystemAction.get(CaseDeleteAction.class).setEnabled(true);
+                CallableSystemAction.get(OpenTimelineAction.class).setEnabled(true);
+                CallableSystemAction.get(OpenOutputFolderAction.class).setEnabled(false);
+
+                /*
+                 * Add the case to the recent cases tracker that supplies a list
+                 * of recent cases to the recent cases menu item and the
+                 * open/create case dialog.
+                 */
+                RecentCases.getInstance().addRecentCase(newCurrentCase.getDisplayName(), newCurrentCase.getMetadata().getFilePath().toString());
+
+                /*
+                 * Open the top components (windows within the main application
+                 * window).
+                 */
+                if (newCurrentCase.hasData()) {
+                    CoreComponentControl.openCoreWindows();
+                }
+
+                /*
+                 * Reset the main window title to:
+                 *
+                 * [curent case display name] - [application name].
+                 */
+                mainFrame.setTitle(newCurrentCase.getDisplayName() + " - " + UserPreferences.getAppName());
+            });
+        }
+    }
+
+    /*
+     * Update the GUI to to reflect the lack of a current case.
+     */
+    private static void updateGUIForCaseClosed() {
+        if (RuntimeProperties.runningWithGUI()) {
+            SwingUtilities.invokeLater(() -> {
+                /*
+                 * Close the top components (windows within the main application
+                 * window).
+                 */
+                CoreComponentControl.closeCoreWindows();
+
+                /*
+                 * Disable the case-specific menu items.
+                 */
+                CallableSystemAction
+                        .get(AddImageAction.class
+                        ).setEnabled(false);
+                CallableSystemAction
+                        .get(CaseCloseAction.class
+                        ).setEnabled(false);
+                CallableSystemAction
+                        .get(CasePropertiesAction.class
+                        ).setEnabled(false);
+                CallableSystemAction
+                        .get(CaseDeleteAction.class
+                        ).setEnabled(false);
+                CallableSystemAction
+                        .get(OpenTimelineAction.class
+                        ).setEnabled(false);
+                CallableSystemAction
+                        .get(OpenOutputFolderAction.class
+                        ).setEnabled(false);
+
+                /*
+                 * Clear the notifications in the notfier component in the lower
+                 * right hand corner of the main application window.
+                 */
+                MessageNotifyUtil.Notify.clear();
+
+                /*
+                 * Reset the main window title to be just the application name,
+                 * instead of [curent case display name] - [application name].
+                 */
+                mainFrame.setTitle(UserPreferences.getAppName());
+            });
+        }
+    }
+
+    /**
+     * Empties the temp subdirectory for the current case.
+     */
+    private static void clearTempSubDir(String tempSubDirPath) {
+        File tempFolder = new File(tempSubDirPath);
+        if (tempFolder.isDirectory()) {
+            File[] files = tempFolder.listFiles();
+            if (files.length > 0) {
+                for (File file : files) {
+                    if (file.isDirectory()) {
+                        FileUtil.deleteDir(file);
+                    } else {
+                        file.delete();
+                    }
+                }
+            }
         }
     }
 
@@ -391,7 +1151,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @return The case database.
      */
     public SleuthkitCase getSleuthkitCase() {
-        return this.db;
+        return this.caseDb;
     }
 
     /**
@@ -400,16 +1160,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @return The case services manager.
      */
     public Services getServices() {
-        return services;
-    }
-
-    /**
-     * Gets the case metadata.
-     *
-     * @return A CaseMetaData object.
-     */
-    CaseMetadata getCaseMetadata() {
-        return caseMetadata;
+        return caseServices;
     }
 
     /**
@@ -418,7 +1169,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @return The case type.
      */
     public CaseType getCaseType() {
-        return getCaseMetadata().getCaseType();
+        return metadata.getCaseType();
     }
 
     /**
@@ -427,43 +1178,25 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @return case The case create date.
      */
     public String getCreatedDate() {
-        return getCaseMetadata().getCreatedDate();
+        return metadata.getCreatedDate();
     }
 
     /**
-     * Gets the case name.
+     * Gets the unique and immutable case name.
      *
      * @return The case name.
      */
     public String getName() {
-        return getCaseMetadata().getCaseName();
+        return metadata.getCaseName();
     }
 
     /**
-     * Updates the case name.
+     * Gets the case name that can be changed by the user.
      *
-     * This should not be called from the EDT.
-     *
-     * @param oldCaseName The old case name.
-     * @param oldPath     The old path name.
-     * @param newCaseName The new case name.
-     * @param newPath     The new case path.
+     * @return The case display name.
      */
-    void updateCaseName(String oldCaseName, String oldPath, String newCaseName, String newPath) throws CaseActionException {
-        try {
-            caseMetadata.setCaseName(newCaseName);
-            eventPublisher.publish(new AutopsyEvent(Events.NAME.toString(), oldCaseName, newCaseName));
-            SwingUtilities.invokeLater(() -> {
-                try {
-                    RecentCases.getInstance().updateRecentCase(oldCaseName, oldPath, newCaseName, newPath); // update the recent case 
-                    addCaseNameToMainWindowTitle(newCaseName);
-                } catch (Exception ex) {
-                    Logger.getLogger(Case.class.getName()).log(Level.SEVERE, "Error updating case name in UI", ex); //NON-NLS
-                }
-            });
-        } catch (Exception ex) {
-            throw new CaseActionException(NbBundle.getMessage(this.getClass(), "Case.updateCaseName.exception.msg"), ex);
-        }
+    public String getDisplayName() {
+        return metadata.getCaseDisplayName();
     }
 
     /**
@@ -472,7 +1205,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @return The case number
      */
     public String getNumber() {
-        return caseMetadata.getCaseNumber();
+        return metadata.getCaseNumber();
     }
 
     /**
@@ -481,7 +1214,34 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @return The examiner name.
      */
     public String getExaminer() {
-        return caseMetadata.getExaminer();
+        return metadata.getExaminer();
+    }
+
+    /**
+     * Gets the examiner phone number.
+     *
+     * @return The examiner phone number.
+     */
+    public String getExaminerPhone() {
+        return metadata.getExaminerPhone();
+    }
+
+    /**
+     * Gets the examiner email address.
+     *
+     * @return The examiner email address.
+     */
+    public String getExaminerEmail() {
+        return metadata.getExaminerEmail();
+    }
+
+    /**
+     * Gets the case notes.
+     *
+     * @return The case notes.
+     */
+    public String getCaseNotes() {
+        return metadata.getCaseNotes();
     }
 
     /**
@@ -490,7 +1250,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @return The top-level case directory path.
      */
     public String getCaseDirectory() {
-        return caseMetadata.getCaseDirectory();
+        return metadata.getCaseDirectory();
     }
 
     /**
@@ -504,7 +1264,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
     public String getOutputDirectory() {
         String caseDirectory = getCaseDirectory();
         Path hostPath;
-        if (getCaseMetadata().getCaseType() == CaseType.MULTI_USER_CASE) {
+        if (CaseType.MULTI_USER_CASE == metadata.getCaseType()) {
             hostPath = Paths.get(caseDirectory, NetworkUtils.getLocalHostName());
         } else {
             hostPath = Paths.get(caseDirectory);
@@ -592,20 +1352,6 @@ public class Case implements SleuthkitCase.ErrorObserver {
     }
 
     /**
-     * Gets the path to the specified subdirectory of the case directory,
-     * creating it if it does not already exist.
-     *
-     * @return The absolute path to the specified subdirectory.
-     */
-    private String getOrCreateSubdirectory(String subDirectoryName) {
-        File subDirectory = Paths.get(getOutputDirectory(), subDirectoryName).toFile();
-        if (!subDirectory.exists()) {
-            subDirectory.mkdirs();
-        }
-        return subDirectory.toString();
-    }
-
-    /**
      * Gets the data sources for the case.
      *
      * @return A list of data sources.
@@ -615,7 +1361,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      *                                                  database.
      */
     public List<Content> getDataSources() throws TskCoreException {
-        List<Content> list = db.getRootObjects();
+        List<Content> list = caseDb.getRootObjects();
         hasDataSources = (list.size() > 0);
         return list;
     }
@@ -642,12 +1388,13 @@ public class Case implements SleuthkitCase.ErrorObserver {
     }
 
     /**
-     * Gets the name of the keyword search index for the case.
+     * Gets the name of the legacy keyword search index for the case. Not for
+     * general use.
      *
      * @return The index name.
      */
     public String getTextIndexName() {
-        return getCaseMetadata().getTextIndexName();
+        return getMetadata().getTextIndexName();
     }
 
     /**
@@ -733,6 +1480,18 @@ public class Case implements SleuthkitCase.ErrorObserver {
     }
 
     /**
+     * Notifies case event subscribers that a tag definition has changed.
+     *
+     * This should not be called from the event dispatch thread (EDT)
+     *
+     * @param changedTagName the name of the tag definition which was changed
+     */
+    public void notifyTagDefinitionChanged(String changedTagName) {
+        //leaving new value of changedTagName as null, because we do not currently support changing the display name of a tag. 
+        eventPublisher.publish(new AutopsyEvent(Events.TAG_DEFINITION_CHANGED.toString(), changedTagName, null));
+    }
+
+    /**
      * Notifies case event subscribers that an artifact tag has been added.
      *
      * This should not be called from the event dispatch thread (EDT)
@@ -773,7 +1532,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
             String errorMsg = "Invalid local path provided: " + localPath; // NON-NLS
             throw new TskCoreException(errorMsg, ex);
         }
-        Report report = this.db.addReport(normalizedLocalPath, srcModuleName, reportName);
+        Report report = this.caseDb.addReport(normalizedLocalPath, srcModuleName, reportName);
         eventPublisher.publish(new ReportAddedEvent(report));
     }
 
@@ -786,7 +1545,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      *                          database.
      */
     public List<Report> getAllReports() throws TskCoreException {
-        return this.db.getAllReports();
+        return this.caseDb.getAllReports();
     }
 
     /**
@@ -799,28 +1558,977 @@ public class Case implements SleuthkitCase.ErrorObserver {
      */
     public void deleteReports(Collection<? extends Report> reports) throws TskCoreException {
         for (Report report : reports) {
-            this.db.deleteReport(report);
+            this.caseDb.deleteReport(report);
             eventPublisher.publish(new AutopsyEvent(Events.REPORT_DELETED.toString(), report, null));
         }
     }
 
     /**
-     * Allows the case database to report internal error conditions in
-     * situations where throwing an exception is not appropriate.
+     * Gets the case metadata.
      *
-     * @param context      The context of the error condition.
-     * @param errorMessage An error message.
+     * @return A CaseMetaData object.
      */
-    @Override
-    public void receiveError(String context, String errorMessage) {
-        /*
-         * NOTE: We are accessing tskErrorReporter from two different threads.
-         * This is ok as long as we only read the value of tskErrorReporter
-         * because tskErrorReporter is declared as volatile.
-         */
-        if (null != tskErrorReporter) {
-            tskErrorReporter.addProblems(context, errorMessage);
+    CaseMetadata getMetadata() {
+        return metadata;
+    }
+
+    /**
+     * Updates the case display name.
+     *
+     * @param newDisplayName the new display name for the case
+     *
+     * @throws org.sleuthkit.autopsy.casemodule.CaseActionException
+     */
+    @Messages({
+        "Case.exceptionMessage.metadataUpdateError=Failed to update case metadata"
+    })
+    void updateCaseDetails(CaseDetails caseDetails) throws CaseActionException {
+        CaseDetails oldCaseDetails = metadata.getCaseDetails();
+        try {
+            metadata.setCaseDetails(caseDetails);
+        } catch (CaseMetadataException ex) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_metadataUpdateError(), ex);
         }
+        if (!oldCaseDetails.getCaseNumber().equals(caseDetails.getCaseNumber())) {
+            eventPublisher.publish(new AutopsyEvent(Events.NUMBER.toString(), oldCaseDetails.getCaseNumber(), caseDetails.getCaseNumber()));
+        }
+        if (!oldCaseDetails.getExaminerName().equals(caseDetails.getExaminerName())) {
+            eventPublisher.publish(new AutopsyEvent(Events.NUMBER.toString(), oldCaseDetails.getExaminerName(), caseDetails.getExaminerName()));
+        }
+        if (!oldCaseDetails.getCaseDisplayName().equals(caseDetails.getCaseDisplayName())) {
+            eventPublisher.publish(new AutopsyEvent(Events.NAME.toString(), oldCaseDetails.getCaseDisplayName(), caseDetails.getCaseDisplayName()));
+        }
+        eventPublisher.publish(new AutopsyEvent(Events.CASE_DETAILS.toString(), oldCaseDetails, caseDetails));
+        if (RuntimeProperties.runningWithGUI()) {
+            SwingUtilities.invokeLater(() -> {
+                mainFrame.setTitle(caseDetails.getCaseDisplayName() + " - " + UserPreferences.getAppName());
+                try {
+                    RecentCases.getInstance().updateRecentCase(oldCaseDetails.getCaseDisplayName(), metadata.getFilePath().toString(), caseDetails.getCaseDisplayName(), metadata.getFilePath().toString());
+                } catch (Exception ex) {
+                    logger.log(Level.SEVERE, "Error updating case name in UI", ex); //NON-NLS
+                }
+            });
+        }
+    }
+
+    /**
+     * Constructs a Case object for a new Autopsy case.
+     *
+     * @param caseType        The type of case (single-user or multi-user).
+     * @param caseDir         The full path of the case directory. The directory
+     *                        will be created if it doesn't already exist; if it
+     *                        exists, it is ASSUMED it was created by calling
+     *                        createCaseDirectory.
+     * @param caseDisplayName The display name of case, which may be changed
+     *                        later by the user.
+     * @param caseNumber      The case number, can be the empty string.
+     * @param examiner        The examiner to associate with the case, can be
+     *                        the empty string.
+     */
+    private Case(CaseType caseType, String caseDir, CaseDetails caseDetails) {
+        metadata = new CaseMetadata(caseType, caseDir, displayNameToUniqueName(caseDetails.getCaseDisplayName()), caseDetails);
+    }
+
+    /**
+     * Constructs a Case object for an existing Autopsy case.
+     *
+     * @param caseMetaData The metadata for the case.
+     */
+    protected Case(CaseMetadata caseMetaData) {
+        metadata = caseMetaData;
+    }
+
+    /**
+     * Opens this case by creating a task running in the same non-UI thread that
+     * will be used to close the case. If the case is a single-user case, this
+     * supports cancelling creation of the case by cancelling the task. If the
+     * case is a multi-user case, this ensures ensures that case directory lock
+     * held as long as the case is open is released in the same thread in which
+     * it was acquired, as is required by the coordination service.
+     *
+     * @param isNewCase True for a new case, false otherwise.
+     *
+     * @throws CaseActionException If there is a problem creating the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     */
+    @Messages({
+        "Case.progressIndicatorTitle.creatingCase=Creating Case",
+        "Case.progressIndicatorTitle.openingCase=Opening Case",
+        "Case.progressIndicatorCancelButton.label=Cancel",
+        "Case.progressMessage.preparing=Preparing...",
+        "Case.progressMessage.preparingToOpenCaseResources=<html>Preparing to open case resources.<br>This may take time if another user is upgrading the case.</html>",
+        "Case.progressMessage.cancelling=Cancelling...",
+        "Case.exceptionMessage.cancelledByUser=Cancelled by user.",
+        "# {0} - exception message", "Case.exceptionMessage.execExceptionWrapperMessage={0}"
+    })
+    private void open(boolean isNewCase) throws CaseActionException {
+        /*
+         * Create and start either a GUI progress indicator with a Cancel button
+         * or a logging progress indicator.
+         */
+        CancelButtonListener cancelButtonListener = null;
+        ProgressIndicator progressIndicator;
+        if (RuntimeProperties.runningWithGUI()) {
+            cancelButtonListener = new CancelButtonListener(Bundle.Case_progressMessage_cancelling());
+            String progressIndicatorTitle = isNewCase ? Bundle.Case_progressIndicatorTitle_creatingCase() : Bundle.Case_progressIndicatorTitle_openingCase();
+            progressIndicator = new ModalDialogProgressIndicator(
+                    mainFrame,
+                    progressIndicatorTitle,
+                    new String[]{Bundle.Case_progressIndicatorCancelButton_label()},
+                    Bundle.Case_progressIndicatorCancelButton_label(),
+                    cancelButtonListener);
+        } else {
+            progressIndicator = new LoggingProgressIndicator();
+        }
+        progressIndicator.start(Bundle.Case_progressMessage_preparing());
+
+        /*
+         * Creating/opening a case is always done by creating a task running in
+         * the same non-UI thread that will be used to close the case, so a
+         * single-threaded executor service is created here and saved as case
+         * state (must be volatile for cancellation to work).
+         *
+         * --- If the case is a single-user case, this supports cancelling
+         * opening of the case by cancelling the task.
+         *
+         * --- If the case is a multi-user case, this still supports
+         * cancellation, but it also makes it possible for the shared case
+         * directory lock held as long as the case is open to be released in the
+         * same thread in which it was acquired, as is required by the
+         * coordination service.
+         */
+        TaskThreadFactory threadFactory = new TaskThreadFactory(String.format(CASE_ACTION_THREAD_NAME, metadata.getCaseName()));
+        caseLockingExecutor = Executors.newSingleThreadExecutor(threadFactory);
+        Future<Void> future = caseLockingExecutor.submit(() -> {
+            if (CaseType.SINGLE_USER_CASE == metadata.getCaseType()) {
+                open(isNewCase, progressIndicator);
+            } else {
+                /*
+                 * First, acquire a shared case directory lock that will be held
+                 * as long as this node has this case open. This will prevent
+                 * deletion of the case by another node. Next, acquire an
+                 * exclusive case resources lock to ensure only one node at a
+                 * time can create/open/upgrade/close the case resources.
+                 */
+                progressIndicator.progress(Bundle.Case_progressMessage_preparingToOpenCaseResources());
+                acquireSharedCaseDirLock(metadata.getCaseDirectory());
+                try (CoordinationService.Lock resourcesLock = acquireExclusiveCaseResourcesLock(metadata.getCaseDirectory())) {
+                    assert (null != resourcesLock);
+                    open(isNewCase, progressIndicator);
+                } catch (CaseActionException ex) {
+                    releaseSharedCaseDirLock(getMetadata().getCaseDirectory());
+                    throw ex;
+                }
+            }
+            return null;
+        });
+        if (null != cancelButtonListener) {
+            cancelButtonListener.setCaseActionFuture(future);
+        }
+
+        /*
+         * Wait for the case creation/opening task to finish.
+         */
+        try {
+            future.get();
+        } catch (InterruptedException discarded) {
+            /*
+             * The thread this method is running in has been interrupted. Cancel
+             * the create/open task, wait for it to finish, and shut down the
+             * executor. This can be done safely because if the task is
+             * completed with a cancellation condition, the case will have been
+             * closed and the case directory lock released will have been
+             * released.
+             */
+            if (null != cancelButtonListener) {
+                cancelButtonListener.actionPerformed(null);
+            } else {
+                future.cancel(true);
+            }
+            ThreadUtils.shutDownTaskExecutor(caseLockingExecutor);
+        } catch (CancellationException discarded) {
+            /*
+             * The create/open task has been cancelled. Wait for it to finish,
+             * and shut down the executor. This can be done safely because if
+             * the task is completed with a cancellation condition, the case
+             * will have been closed and the case directory lock released will
+             * have been released.
+             */
+            ThreadUtils.shutDownTaskExecutor(caseLockingExecutor);
+            throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+        } catch (ExecutionException ex) {
+            /*
+             * The create/open task has thrown an exception. Wait for it to
+             * finish, and shut down the executor. This can be done safely
+             * because if the task is completed with an execution condition, the
+             * case will have been closed and the case directory lock released
+             * will have been released.
+             */
+            ThreadUtils.shutDownTaskExecutor(caseLockingExecutor);
+            throw new CaseActionException(Bundle.Case_exceptionMessage_execExceptionWrapperMessage(ex.getCause().getLocalizedMessage()), ex);
+        } finally {
+            progressIndicator.finish();
+        }
+    }
+
+    /**
+     * Opens the case database and services for this case.
+     *
+     * @param isNewCase         True for a new case, false otherwise.
+     * @param progressIndicator A progress indicator.
+     *
+     * @throws CaseActionException if there is a problem creating the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     */
+    private void open(boolean isNewCase, ProgressIndicator progressIndicator) throws CaseActionException {
+        try {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+            }
+
+            if (isNewCase) {
+                createCaseData(progressIndicator);
+            } else {
+                openCaseData(progressIndicator);
+            }
+
+            if (Thread.currentThread().isInterrupted()) {
+                throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+            }
+
+            openServices(progressIndicator);
+
+            if (Thread.currentThread().isInterrupted()) {
+                throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+            }
+        } catch (CaseActionException ex) {
+            /*
+             * Cancellation or failure. Clean up. The sleep is a little hack to
+             * clear the interrupted flag for this thread if this is a
+             * cancellation scenario, so that the clean up can run to completion
+             * in this thread.
+             */
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException discarded) {
+            }
+            close(progressIndicator);
+            throw ex;
+        }
+    }
+
+    /**
+     * Creates the case directory, case database, and case metadata file.
+     *
+     * @param progressIndicator A progress indicartor.
+     *
+     * @throws CaseActionException If there is a problem creating the case
+     *                             database. The exception will have a
+     *                             user-friendly message and may be a wrapper
+     *                             for a lower-level exception.
+     */
+    @Messages({
+        "Case.progressMessage.creatingCaseDirectory=Creating case directory...",
+        "Case.progressMessage.creatingCaseDatabase=Creating case database...",
+        "# {0} - exception message", "Case.exceptionMessage.couldNotCreateCaseDatabase=Failed to create case database:\n{0}",
+        "Case.exceptionMessage.couldNotCreateMetadataFile=Failed to create case metadata file."
+    })
+    private void createCaseData(ProgressIndicator progressIndicator) throws CaseActionException {
+        /*
+         * Create the case directory, if it does not already exist.
+         *
+         * TODO (JIRA-2180): Always create the case directory as part of the
+         * case creation process.
+         */
+        if (new File(metadata.getCaseDirectory()).exists() == false) {
+            progressIndicator.progress(Bundle.Case_progressMessage_creatingCaseDirectory());
+            Case.createCaseDirectory(metadata.getCaseDirectory(), metadata.getCaseType());
+        }
+
+        /*
+         * Create the case database.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_creatingCaseDatabase());
+        try {
+            if (CaseType.SINGLE_USER_CASE == metadata.getCaseType()) {
+                /*
+                 * For single-user cases, the case database is a SQLite database
+                 * with a standard name, physically located in the root of the
+                 * case directory.
+                 */
+                caseDb = SleuthkitCase.newCase(Paths.get(metadata.getCaseDirectory(), SINGLE_USER_CASE_DB_NAME).toString());
+                metadata.setCaseDatabaseName(SINGLE_USER_CASE_DB_NAME);
+            } else {
+                /*
+                 * For multi-user cases, the case database is a PostgreSQL
+                 * database with a name derived from the case display name,
+                 * physically located on a database server.
+                 */
+                caseDb = SleuthkitCase.newCase(metadata.getCaseDisplayName(), UserPreferences.getDatabaseConnectionInfo(), metadata.getCaseDirectory());
+                metadata.setCaseDatabaseName(caseDb.getDatabaseName());
+            }
+        } catch (TskCoreException ex) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_couldNotCreateCaseDatabase(ex.getLocalizedMessage()), ex);
+        } catch (UserPreferencesException ex) {
+            throw new CaseActionException(NbBundle.getMessage(Case.class, "Case.databaseConnectionInfo.error.msg"), ex);
+        } catch (CaseMetadataException ex) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_couldNotCreateMetadataFile(), ex);
+        }
+    }
+
+    /**
+     * Opens an existing case database.
+     *
+     * @param progressIndicator A progress indicator.
+     *
+     * @throws CaseActionException if there is a problem opening the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     */
+    @Messages({
+        "Case.progressMessage.openingCaseDatabase=Opening case database...",
+        "Case.exceptionMessage.couldNotOpenCaseDatabase=Failed to open case database.",
+        "Case.unsupportedSchemaVersionMessage=Unsupported DB schema version - see log for details",
+        "Case.databaseConnectionInfo.error.msg=Error accessing database server connection info. See Tools, Options, Multi-User.",
+        "Case.open.exception.multiUserCaseNotEnabled=Cannot open a multi-user case if multi-user cases are not enabled. "
+        + "See Tools, Options, Multi-user."
+    })
+    private void openCaseData(ProgressIndicator progressIndicator) throws CaseActionException {
+        try {
+            progressIndicator.progress(Bundle.Case_progressMessage_openingCaseDatabase());
+            String databaseName = metadata.getCaseDatabaseName();
+            if (CaseType.SINGLE_USER_CASE == metadata.getCaseType()) {
+                caseDb = SleuthkitCase.openCase(Paths.get(metadata.getCaseDirectory(), databaseName).toString());
+            } else if (UserPreferences.getIsMultiUserModeEnabled()) {
+                try {
+                    caseDb = SleuthkitCase.openCase(databaseName, UserPreferences.getDatabaseConnectionInfo(), metadata.getCaseDirectory());
+                } catch (UserPreferencesException ex) {
+                    throw new CaseActionException(Case_databaseConnectionInfo_error_msg(), ex);
+                }
+            } else {
+                throw new CaseActionException(Case_open_exception_multiUserCaseNotEnabled());
+            }
+        } catch (TskUnsupportedSchemaVersionException ex) {
+            throw new CaseActionException(Bundle.Case_unsupportedSchemaVersionMessage(), ex);
+        } catch (TskCoreException ex) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_couldNotOpenCaseDatabase(), ex);
+        }
+    }
+
+    /**
+     * Completes the case opening tasks common to both new cases and existing
+     * cases.
+     *
+     * @param progressIndicator A progress indicator.
+     *
+     * @throws CaseActionException
+     */
+    @Messages({
+        "Case.progressMessage.switchingLogDirectory=Switching log directory...",
+        "Case.progressMessage.clearingTempDirectory=Clearing case temp directory...",
+        "Case.progressMessage.openingCaseLevelServices=Opening case-level services...",
+        "Case.progressMessage.openingApplicationServiceResources=Opening application service case resources...",
+        "Case.progressMessage.settingUpNetworkCommunications=Setting up network communications...",})
+    private void openServices(ProgressIndicator progressIndicator) throws CaseActionException {
+        /*
+         * Switch to writing to the application logs in the logs subdirectory of
+         * the case directory.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_switchingLogDirectory());
+        Logger.setLogDirectory(getLogDirectoryPath());
+        if (Thread.currentThread().isInterrupted()) {
+            throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+        }
+
+        /*
+         * Clear the temp subdirectory of the case directory.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_clearingTempDirectory());
+        Case.clearTempSubDir(this.getTempDirectory());
+        if (Thread.currentThread().isInterrupted()) {
+            throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+        }
+
+        /*
+         * Open the case-level services.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_openingCaseLevelServices());
+        this.caseServices = new Services(caseDb);
+        if (Thread.currentThread().isInterrupted()) {
+            throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+        }
+
+        /*
+         * Allow any registered application services to open any resources
+         * specific to this case.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_openingApplicationServiceResources());
+        openAppServiceCaseResources();
+        if (Thread.currentThread().isInterrupted()) {
+            throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+        }
+
+        /*
+         * If this case is a multi-user case, set up for communication with
+         * other nodes.
+         */
+        if (CaseType.MULTI_USER_CASE == metadata.getCaseType()) {
+            progressIndicator.progress(Bundle.Case_progressMessage_settingUpNetworkCommunications());
+            try {
+                eventPublisher.openRemoteEventChannel(String.format(EVENT_CHANNEL_NAME, metadata.getCaseName()));
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+                }
+                collaborationMonitor = new CollaborationMonitor(metadata.getCaseName());
+            } catch (AutopsyEventException | CollaborationMonitor.CollaborationMonitorException ex) {
+                /*
+                 * The collaboration monitor and event channel are not
+                 * essential. Log an error and notify the user, but do not
+                 * throw.
+                 */
+                logger.log(Level.SEVERE, "Failed to setup network communications", ex); //NON-NLS
+                if (RuntimeProperties.runningWithGUI()) {
+                    SwingUtilities.invokeLater(() -> MessageNotifyUtil.Notify.error(
+                            NbBundle.getMessage(Case.class, "Case.CollaborationSetup.FailNotify.Title"),
+                            NbBundle.getMessage(Case.class, "Case.CollaborationSetup.FailNotify.ErrMsg")));
+                }
+            }
+        }
+    }
+
+    /**
+     * Allows any registered application-level services to open resources
+     * specific to this case.
+     */
+    @NbBundle.Messages({
+        "# {0} - service name", "Case.serviceOpenCaseResourcesProgressIndicator.title={0} Opening Case Resources",
+        "# {0} - service name", "Case.serviceOpenCaseResourcesProgressIndicator.cancellingMessage=Cancelling opening case resources by {0}...",
+        "# {0} - service name", "Case.servicesException.notificationTitle={0} Error"
+    })
+    private void openAppServiceCaseResources() throws CaseActionException {
+        /*
+         * Each service gets its own independently cancellable/interruptible
+         * task, running in a named thread managed by an executor service, with
+         * its own progress indicator. This allows for cancellation of the
+         * opening of case resources for individual services. It also makes it
+         * possible to ensure that each service task completes before the next
+         * one starts by awaiting termination of the executor service.
+         */
+        for (AutopsyService service : Lookup.getDefault().lookupAll(AutopsyService.class)) {
+            /*
+             * Create a progress indicator for the task and start the task. If
+             * running with a GUI, the progress indicator will be a dialog box
+             * with a Cancel button.
+             */
+            CancelButtonListener cancelButtonListener = null;
+            ProgressIndicator progressIndicator;
+            if (RuntimeProperties.runningWithGUI()) {
+                cancelButtonListener = new CancelButtonListener(Bundle.Case_serviceOpenCaseResourcesProgressIndicator_cancellingMessage(service.getServiceName()));
+                progressIndicator = new ModalDialogProgressIndicator(
+                        mainFrame,
+                        Bundle.Case_serviceOpenCaseResourcesProgressIndicator_title(service.getServiceName()),
+                        new String[]{Bundle.Case_progressIndicatorCancelButton_label()},
+                        Bundle.Case_progressIndicatorCancelButton_label(),
+                        cancelButtonListener);
+            } else {
+                progressIndicator = new LoggingProgressIndicator();
+            }
+            progressIndicator.start(Bundle.Case_progressMessage_preparing());
+            AutopsyService.CaseContext context = new AutopsyService.CaseContext(this, progressIndicator);
+            String threadNameSuffix = service.getServiceName().replaceAll("[ ]", "-"); //NON-NLS
+            threadNameSuffix = threadNameSuffix.toLowerCase();
+            TaskThreadFactory threadFactory = new TaskThreadFactory(String.format(CASE_RESOURCES_THREAD_NAME, threadNameSuffix));
+            ExecutorService executor = Executors.newSingleThreadExecutor(threadFactory);
+            Future<Void> future = executor.submit(() -> {
+                service.openCaseResources(context);
+                return null;
+            });
+            if (null != cancelButtonListener) {
+                cancelButtonListener.setCaseContext(context);
+                cancelButtonListener.setCaseActionFuture(future);
+            }
+
+            /*
+             * Wait for the task to either be completed or
+             * cancelled/interrupted, or for the opening of the case to be
+             * cancelled.
+             */
+            try {
+                future.get();
+            } catch (InterruptedException discarded) {
+                /*
+                 * The parent create/open case task has been cancelled.
+                 */
+                Case.logger.log(Level.WARNING, String.format("Opening of %s (%s) in %s cancelled during opening of case resources by %s", getDisplayName(), getName(), getCaseDirectory(), service.getServiceName()));
+                future.cancel(true);
+            } catch (CancellationException discarded) {
+                /*
+                 * The opening of case resources by the application service has
+                 * been cancelled, so the executor service has thrown. Note that
+                 * there is no guarantee the task itself has responded to the
+                 * cancellation request yet.
+                 */
+                Case.logger.log(Level.WARNING, String.format("Opening of case resources by %s for %s (%s) in %s cancelled", service.getServiceName(), getDisplayName(), getName(), getCaseDirectory(), service.getServiceName()));
+            } catch (ExecutionException ex) {
+                /*
+                 * An exception was thrown while executing the task. The
+                 * case-specific application service resources are not
+                 * essential. Log an error and notify the user if running the
+                 * desktop GUI, but do not throw.
+                 */
+                Case.logger.log(Level.SEVERE, String.format("%s failed to open case resources for %s", service.getServiceName(), this.getDisplayName()), ex);
+                if (RuntimeProperties.runningWithGUI()) {
+                    SwingUtilities.invokeLater(() -> {
+                        MessageNotifyUtil.Notify.error(Bundle.Case_servicesException_notificationTitle(service.getServiceName()), ex.getLocalizedMessage());
+                    });
+                }
+            } finally {
+                /*
+                 * Shut down the executor service and wait for it to finish.
+                 * This ensures that the task has finished. Without this, it
+                 * would be possible to start the next task before the current
+                 * task responded to a cancellation request.
+                 */
+                ThreadUtils.shutDownTaskExecutor(executor);
+                progressIndicator.finish();
+            }
+
+            if (Thread.currentThread().isInterrupted()) {
+                throw new CaseActionCancelledException(Bundle.Case_exceptionMessage_cancelledByUser());
+            }
+        }
+    }
+
+    /**
+     * Closes the case.
+     */
+    private void close() throws CaseActionException {
+        /*
+         * Set up either a GUI progress indicator without a Cancel button or a
+         * logging progress indicator.
+         */
+        ProgressIndicator progressIndicator;
+        if (RuntimeProperties.runningWithGUI()) {
+            progressIndicator = new ModalDialogProgressIndicator(
+                    mainFrame,
+                    Bundle.Case_progressIndicatorTitle_closingCase());
+        } else {
+            progressIndicator = new LoggingProgressIndicator();
+        }
+        progressIndicator.start(Bundle.Case_progressMessage_preparing());
+
+        /*
+         * Closing a case is always done in the same non-UI thread that
+         * opened/created the case. If the case is a multi-user case, this
+         * ensures that case directory lock that is held as long as the case is
+         * open is released in the same thread in which it was acquired, as is
+         * required by the coordination service.
+         */
+        Future<Void> future = caseLockingExecutor.submit(() -> {
+            if (CaseType.SINGLE_USER_CASE == metadata.getCaseType()) {
+                close(progressIndicator);
+            } else {
+                /*
+                 * Acquire an exclusive case resources lock to ensure only one
+                 * node at a time can create/open/upgrade/close the case
+                 * resources.
+                 */
+                progressIndicator.progress(Bundle.Case_progressMessage_preparing());
+                try (CoordinationService.Lock resourcesLock = acquireExclusiveCaseResourcesLock(metadata.getCaseDirectory())) {
+                    assert (null != resourcesLock);
+                    close(progressIndicator);
+                } finally {
+                    /*
+                     * Always release the case directory lock that was acquired
+                     * when the case was opened.
+                     */
+                    releaseSharedCaseDirLock(metadata.getCaseName());
+                }
+            }
+            return null;
+        });
+
+        try {
+            future.get();
+        } catch (InterruptedException | CancellationException unused) {
+            /*
+             * The wait has been interrupted by interrupting the thread running
+             * this method. Not allowing cancellation of case closing, so ignore
+             * the interrupt. Likewsie, cancellation of the case closing task is
+             * not supported.
+             */
+        } catch (ExecutionException ex) {
+            throw new CaseActionException(Bundle.Case_exceptionMessage_execExceptionWrapperMessage(ex.getCause().getMessage()), ex);
+        } finally {
+            ThreadUtils.shutDownTaskExecutor(caseLockingExecutor);
+            progressIndicator.finish();
+        }
+    }
+
+    /**
+     * Closes the case.
+     *
+     * @param progressIndicator A progress indicator.
+     */
+    @Messages({
+        "Case.progressMessage.shuttingDownNetworkCommunications=Shutting down network communications...",
+        "Case.progressMessage.closingApplicationServiceResources=Closing case-specific application service resources...",
+        "Case.progressMessage.closingCaseLevelServices=Closing case-level services...",
+        "Case.progressMessage.closingCaseDatabase=Closing case database..."
+    })
+    private void close(ProgressIndicator progressIndicator) {
+        IngestManager.getInstance().cancelAllIngestJobs(IngestJob.CancellationReason.CASE_CLOSED);
+
+        /*
+         * Stop sending/receiving case events to and from other nodes if this is
+         * a multi-user case.
+         */
+        if (CaseType.MULTI_USER_CASE == metadata.getCaseType()) {
+            progressIndicator.progress(Bundle.Case_progressMessage_shuttingDownNetworkCommunications());
+            if (null != collaborationMonitor) {
+                collaborationMonitor.shutdown();
+            }
+            eventPublisher.closeRemoteEventChannel();
+        }
+
+        /*
+         * Allow all registered application services providers to close
+         * resources related to the case.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_closingApplicationServiceResources());
+        closeAppServiceCaseResources();
+
+        /*
+         * Close the case-level services.
+         */
+        if (null != caseServices) {
+            progressIndicator.progress(Bundle.Case_progressMessage_closingCaseLevelServices());
+            try {
+                this.caseServices.close();
+            } catch (IOException ex) {
+                logger.log(Level.SEVERE, String.format("Error closing internal case services for %s at %s", this.getName(), this.getCaseDirectory()), ex);
+            }
+        }
+
+        /*
+         * Close the case database
+         */
+        if (null != caseDb) {
+            progressIndicator.progress(Bundle.Case_progressMessage_closingCaseDatabase());
+            caseDb.close();
+        }
+
+        /*
+         * Switch the log directory.
+         */
+        progressIndicator.progress(Bundle.Case_progressMessage_switchingLogDirectory());
+        Logger.setLogDirectory(PlatformUtil.getLogDirectory());
+    }
+
+    /**
+     * Allows any registered application-level services to close any resources
+     * specific to this case.
+     */
+    @Messages({
+        "# {0} - serviceName", "Case.serviceCloseResourcesProgressIndicator.title={0} Closing Case Resources",
+        "# {0} - service name", "# {1} - exception message", "Case.servicesException.serviceResourcesCloseError=Could not close case resources for {0} service: {1}"
+    })
+    private void closeAppServiceCaseResources() {
+        /*
+         * Each service gets its own independently cancellable task, and thus
+         * its own task progress indicator.
+         */
+        for (AutopsyService service : Lookup.getDefault().lookupAll(AutopsyService.class)) {
+            ProgressIndicator progressIndicator;
+            if (RuntimeProperties.runningWithGUI()) {
+                progressIndicator = new ModalDialogProgressIndicator(
+                        mainFrame,
+                        Bundle.Case_serviceCloseResourcesProgressIndicator_title(service.getServiceName()));
+            } else {
+                progressIndicator = new LoggingProgressIndicator();
+            }
+            progressIndicator.start(Bundle.Case_progressMessage_preparing());
+            AutopsyService.CaseContext context = new AutopsyService.CaseContext(this, progressIndicator);
+            String threadNameSuffix = service.getServiceName().replaceAll("[ ]", "-"); //NON-NLS
+            threadNameSuffix = threadNameSuffix.toLowerCase();
+            TaskThreadFactory threadFactory = new TaskThreadFactory(String.format(CASE_RESOURCES_THREAD_NAME, threadNameSuffix));
+            ExecutorService executor = Executors.newSingleThreadExecutor(threadFactory);
+            Future<Void> future = executor.submit(() -> {
+                service.closeCaseResources(context);
+                return null;
+            });
+            try {
+                future.get();
+            } catch (InterruptedException ex) {
+                Case.logger.log(Level.SEVERE, String.format("Unexpected interrupt while waiting on %s service to close case resources", service.getServiceName()), ex);
+            } catch (CancellationException ex) {
+                Case.logger.log(Level.SEVERE, String.format("Unexpected cancellation while waiting on %s service to close case resources", service.getServiceName()), ex);
+            } catch (ExecutionException ex) {
+                Case.logger.log(Level.SEVERE, String.format("%s service failed to open case resources", service.getServiceName()), ex);
+                if (RuntimeProperties.runningWithGUI()) {
+                    SwingUtilities.invokeLater(() -> MessageNotifyUtil.Notify.error(
+                            Bundle.Case_servicesException_notificationTitle(service.getServiceName()),
+                            Bundle.Case_servicesException_serviceResourcesCloseError(service.getServiceName(), ex.getLocalizedMessage())));
+                }
+            } finally {
+                ThreadUtils.shutDownTaskExecutor(executor);
+                progressIndicator.finish();
+            }
+        }
+    }
+
+    /**
+     * Acquires a shared case directory lock for the current case.
+     *
+     * @param caseDir The full path of the case directory.
+     *
+     * @throws CaseActionException with a user-friendly message if the lock
+     *                             cannot be acquired.
+     */
+    @Messages({"Case.creationException.couldNotAcquireDirLock=Failed to get lock on case directory."})
+    private void acquireSharedCaseDirLock(String caseDir) throws CaseActionException {
+        try {
+            caseDirLock = CoordinationService.getInstance().tryGetSharedLock(CategoryNode.CASES, caseDir, DIR_LOCK_TIMOUT_HOURS, TimeUnit.HOURS);
+            if (null == caseDirLock) {
+                throw new CaseActionException(Bundle.Case_creationException_couldNotAcquireDirLock());
+            }
+        } catch (InterruptedException | CoordinationServiceException ex) {
+            throw new CaseActionException(Bundle.Case_creationException_couldNotAcquireDirLock(), ex);
+        }
+    }
+
+    /**
+     * Releases a shared case directory lock for the current case.
+     *
+     * @param caseDir The full path of the case directory.
+     */
+    private void releaseSharedCaseDirLock(String caseDir) {
+        if (caseDirLock != null) {
+            try {
+                caseDirLock.release();
+                caseDirLock = null;
+            } catch (CoordinationService.CoordinationServiceException ex) {
+                logger.log(Level.SEVERE, String.format("Failed to release shared case directory lock for %s", caseDir), ex);
+            }
+        }
+    }
+
+    /**
+     * Gets the path to the specified subdirectory of the case directory,
+     * creating it if it does not already exist.
+     *
+     * @return The absolute path to the specified subdirectory.
+     */
+    private String getOrCreateSubdirectory(String subDirectoryName) {
+        File subDirectory = Paths.get(getOutputDirectory(), subDirectoryName).toFile();
+        if (!subDirectory.exists()) {
+            subDirectory.mkdirs();
+        }
+        return subDirectory.toString();
+
+    }
+
+    /**
+     * A case operation Cancel button listener for use with a
+     * ModalDialogProgressIndicator when running with a GUI.
+     */
+    @ThreadSafe
+    private final static class CancelButtonListener implements ActionListener {
+
+        private final String cancellationMessage;
+        @GuardedBy("this")
+        private boolean cancelRequested;
+        @GuardedBy("this")
+        private CaseContext caseContext;
+        @GuardedBy("this")
+        private Future<?> caseActionFuture;
+
+        /**
+         * Constructs a case operation Cancel button listener for use with a
+         * ModalDialogProgressIndicator when running with a GUI.
+         *
+         * @param cancellationMessage The message to display in the
+         *                            ModalDialogProgressIndicator when the
+         *                            cancel button is pressed.
+         */
+        private CancelButtonListener(String cancellationMessage) {
+            this.cancellationMessage = cancellationMessage;
+        }
+
+        /**
+         * Sets a case context for this listener.
+         *
+         * @param caseContext A case context object.
+         */
+        private synchronized void setCaseContext(CaseContext caseContext) {
+            this.caseContext = caseContext;
+            /*
+             * If the cancel button has already been pressed, pass the
+             * cancellation on to the case context.
+             */
+            if (cancelRequested) {
+                cancel();
+            }
+        }
+
+        /**
+         * Sets a Future object for a task associated with this listener.
+         *
+         * @param caseActionFuture A task Future object.
+         */
+        private synchronized void setCaseActionFuture(Future<?> caseActionFuture) {
+            this.caseActionFuture = caseActionFuture;
+            /*
+             * If the cancel button has already been pressed, cancel the Future
+             * of the task.
+             */
+            if (cancelRequested) {
+                cancel();
+            }
+        }
+
+        /**
+         * The event handler for Cancel button pushes.
+         *
+         * @param event The button event, ignored, can be null.
+         */
+        @Override
+        public synchronized void actionPerformed(ActionEvent event) {
+            cancel();
+        }
+
+        /**
+         * Handles a cancellation request.
+         */
+        private void cancel() {
+            /*
+             * At a minimum, set the cancellation requested flag of this
+             * listener.
+             */
+            this.cancelRequested = true;
+            if (null != this.caseContext) {
+                /*
+                 * Set the cancellation request flag and display the
+                 * cancellation message in the progress indicator for the case
+                 * context associated with this listener.
+                 */
+                if (RuntimeProperties.runningWithGUI()) {
+                    ProgressIndicator progressIndicator = this.caseContext.getProgressIndicator();
+                    if (progressIndicator instanceof ModalDialogProgressIndicator) {
+                        ((ModalDialogProgressIndicator) progressIndicator).setCancelling(cancellationMessage);
+                    }
+                }
+                this.caseContext.requestCancel();
+            }
+            if (null != this.caseActionFuture) {
+                /*
+                 * Cancel the Future of the task associated with this listener.
+                 * Note that the task thread will be interrupted if the task is
+                 * blocked.
+                 */
+                this.caseActionFuture.cancel(true);
+            }
+        }
+    }
+
+    /**
+     * A thread factory that provides named threads.
+     */
+    private static class TaskThreadFactory implements ThreadFactory {
+
+        private final String threadName;
+
+        private TaskThreadFactory(String threadName) {
+            this.threadName = threadName;
+        }
+
+        @Override
+        public Thread newThread(Runnable task) {
+            return new Thread(task, threadName);
+        }
+
+    }
+
+    /**
+     * Gets the application name.
+     *
+     * @return The application name.
+     *
+     * @deprecated
+     */
+    @Deprecated
+    public static String getAppName() {
+        return UserPreferences.getAppName();
+    }
+
+    /**
+     * Creates a new, single-user Autopsy case.
+     *
+     * @param caseDir         The full path of the case directory. The directory
+     *                        will be created if it doesn't already exist; if it
+     *                        exists, it is ASSUMED it was created by calling
+     *                        createCaseDirectory.
+     * @param caseDisplayName The display name of case, which may be changed
+     *                        later by the user.
+     * @param caseNumber      The case number, can be the empty string.
+     * @param examiner        The examiner to associate with the case, can be
+     *                        the empty string.
+     *
+     * @throws CaseActionException if there is a problem creating the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     * @deprecated Use createAsCurrentCase instead.
+     */
+    @Deprecated
+    public static void create(String caseDir, String caseDisplayName, String caseNumber, String examiner) throws CaseActionException {
+        createAsCurrentCase(caseDir, caseDisplayName, caseNumber, examiner, CaseType.SINGLE_USER_CASE);
+    }
+
+    /**
+     * Creates a new Autopsy case and makes it the current case.
+     *
+     * @param caseDir         The full path of the case directory. The directory
+     *                        will be created if it doesn't already exist; if it
+     *                        exists, it is ASSUMED it was created by calling
+     *                        createCaseDirectory.
+     * @param caseDisplayName The display name of case, which may be changed
+     *                        later by the user.
+     * @param caseNumber      The case number, can be the empty string.
+     * @param examiner        The examiner to associate with the case, can be
+     *                        the empty string.
+     * @param caseType        The type of case (single-user or multi-user).
+     *
+     * @throws CaseActionException if there is a problem creating the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     * @deprecated Use createAsCurrentCase instead.
+     */
+    @Deprecated
+    public static void create(String caseDir, String caseDisplayName, String caseNumber, String examiner, CaseType caseType) throws CaseActionException {
+        createAsCurrentCase(caseDir, caseDisplayName, caseNumber, examiner, caseType);
+    }
+
+    /**
+     * Opens an existing Autopsy case and makes it the current case.
+     *
+     * @param caseMetadataFilePath The path of the case metadata (.aut) file.
+     *
+     * @throws CaseActionException if there is a problem opening the case. The
+     *                             exception will have a user-friendly message
+     *                             and may be a wrapper for a lower-level
+     *                             exception.
+     * @deprecated Use openAsCurrentCase instead.
+     */
+    @Deprecated
+    public static void open(String caseMetadataFilePath) throws CaseActionException {
+        openAsCurrentCase(caseMetadataFilePath);
     }
 
     /**
@@ -830,670 +2538,11 @@ public class Case implements SleuthkitCase.ErrorObserver {
      *                             exception will have a user-friendly message
      *                             and may be a wrapper for a lower-level
      *                             exception.
+     * @deprecated Use closeCurrentCase instead.
      */
+    @Deprecated
     public void closeCase() throws CaseActionException {
-        changeCurrentCase(null);
-        try {
-            services.close();
-            this.db.close();
-        } catch (Exception e) {
-            throw new CaseActionException(NbBundle.getMessage(this.getClass(), "Case.closeCase.exception.msg"), e);
-        }
-    }
-
-    /**
-     * Deletes the case folder for this Autopsy case and sets the current case
-     * to null. It does not not delete the case database for a multi-user case.
-     *
-     * @param caseDir The case directory to delete.
-     *
-     * @throws CaseActionException exception throw if case could not be deleted
-     */
-    void deleteCase(File caseDir) throws CaseActionException {
-        logger.log(Level.INFO, "Deleting case.\ncaseDir: {0}", caseDir); //NON-NLS
-
-        try {
-            boolean result = deleteCaseDirectory(caseDir);
-
-            RecentCases.getInstance().removeRecentCase(this.caseMetadata.getCaseName(), this.caseMetadata.getFilePath().toString()); // remove it from the recent case
-            Case.changeCurrentCase(null);
-            if (result == false) {
-                throw new CaseActionException(
-                        NbBundle.getMessage(this.getClass(), "Case.deleteCase.exception.msg", caseDir));
-            }
-
-        } catch (Exception ex) {
-            logger.log(Level.SEVERE, "Error deleting the current case dir: " + caseDir, ex); //NON-NLS
-            throw new CaseActionException(
-                    NbBundle.getMessage(this.getClass(), "Case.deleteCase.exception.msg2", caseDir), ex);
-        }
-    }
-
-    /**
-     * Gets the application name.
-     *
-     * @return The application name.
-     */
-    public static String getAppName() {
-        if ((appName == null) || appName.equals("")) {
-            appName = WindowManager.getDefault().getMainWindow().getTitle();
-        }
-        return appName;
-    }
-
-    /**
-     * Checks if a string is a valid case name.
-     *
-     * TODO( AUT-2221): This should incorporate the vlaidity checks of
-     * sanitizeCaseName.
-     *
-     * @param caseName The candidate string.
-     *
-     * @return True or false.
-     */
-    public static boolean isValidName(String caseName) {
-        return !(caseName.contains("\\") || caseName.contains("/") || caseName.contains(":")
-                || caseName.contains("*") || caseName.contains("?") || caseName.contains("\"")
-                || caseName.contains("<") || caseName.contains(">") || caseName.contains("|"));
-    }
-
-    /**
-     * Creates a new single-user Autopsy case.
-     *
-     * @param caseDir    The full path of the case directory. It will be created
-     *                   if it doesn't already exist; if it exists, it should
-     *                   have been created using Case.createCaseDirectory to
-     *                   ensure that the required sub-directories were created.
-     * @param caseName   The name of case.
-     * @param caseNumber The case number, can be the empty string.
-     * @param examiner   The examiner to associate with the case, can be the
-     *                   empty string.
-     *
-     * @throws CaseActionException if there is a problem creating the case. The
-     *                             exception will have a user-friendly message
-     *                             and may be a wrapper for a lower-level
-     *                             exception.
-     */
-    public static void create(String caseDir, String caseName, String caseNumber, String examiner) throws CaseActionException {
-        create(caseDir, caseName, caseNumber, examiner, CaseType.SINGLE_USER_CASE);
-    }
-
-    /**
-     * Creates a new Autopsy case.
-     *
-     * @param caseDir    The full path of the case directory. It will be created
-     *                   if it doesn't already exist; if it exists, it should
-     *                   have been created using Case.createCaseDirectory() to
-     *                   ensure that the required sub-directories were created.
-     * @param caseName   The name of case.
-     * @param caseNumber The case number, can be the empty string.
-     * @param examiner   The examiner to associate with the case, can be the
-     *                   empty string.
-     * @param caseType   The type of case (single-user or multi-user).
-     *
-     * @throws CaseActionException if there is a problem creating the case. The
-     *                             exception will have a user-friendly message
-     *                             and may be a wrapper for a lower-level
-     *                             exception.
-     */
-    @Messages({"Case.creationException=Could not create case: failed to create case metadata file."})
-    public static void create(String caseDir, String caseName, String caseNumber, String examiner, CaseType caseType) throws CaseActionException {
-        logger.log(Level.INFO, "Attempting to create case {0} in directory = {1}", new Object[]{caseName, caseDir}); //NON-NLS
-
-        /*
-         * Create case directory if it doesn't already exist.
-         */
-        if (new File(caseDir).exists() == false) {
-            Case.createCaseDirectory(caseDir, caseType);
-        }
-
-        /*
-         * Sanitize the case name, create a unique keyword search index name,
-         * and create a standard (single-user) or unique (multi-user) case
-         * database name.
-         */
-        String santizedCaseName = sanitizeCaseName(caseName);
-        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMdd_HHmmss");
-        Date date = new Date();
-        String indexName = santizedCaseName + "_" + dateFormat.format(date);
-        String dbName = null;
-        if (caseType == CaseType.SINGLE_USER_CASE) {
-            dbName = caseDir + File.separator + "autopsy.db"; //NON-NLS
-        } else if (caseType == CaseType.MULTI_USER_CASE) {
-            dbName = indexName;
-        }
-
-        /*
-         * Create the case metadata (.aut) file.
-         */
-        CaseMetadata metadata;
-        try {
-            metadata = new CaseMetadata(caseDir, caseType, caseName, caseNumber, examiner, dbName, indexName);
-        } catch (CaseMetadataException ex) {
-            throw new CaseActionException(Bundle.Case_creationException(), ex);
-        }
-
-        /*
-         * Create the case database.
-         */
-        SleuthkitCase db = null;
-        try {
-            if (caseType == CaseType.SINGLE_USER_CASE) {
-                db = SleuthkitCase.newCase(dbName);
-            } else if (caseType == CaseType.MULTI_USER_CASE) {
-                db = SleuthkitCase.newCase(dbName, UserPreferences.getDatabaseConnectionInfo(), caseDir);
-            }
-        } catch (TskCoreException ex) {
-            logger.log(Level.SEVERE, String.format("Error creating a case %s in %s ", caseName, caseDir), ex); //NON-NLS
-            SwingUtilities.invokeLater(() -> {
-                WindowManager.getDefault().getMainWindow().setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
-            });
-            /*
-             * SleuthkitCase.newCase throws TskCoreExceptions with user-friendly
-             * messages, so propagate the exception message.
-             */
-            throw new CaseActionException(ex.getMessage(), ex); //NON-NLS
-        } catch (UserPreferencesException ex) {
-            logger.log(Level.SEVERE, "Error accessing case database connection info", ex); //NON-NLS
-            SwingUtilities.invokeLater(() -> {
-                WindowManager.getDefault().getMainWindow().setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
-            });
-            throw new CaseActionException(NbBundle.getMessage(Case.class, "Case.databaseConnectionInfo.error.msg"), ex);
-        }
-
-        Case newCase = new Case(metadata, db);
-        changeCurrentCase(newCase);
-
-        logger.log(Level.INFO, "Created case {0} in directory = {1}", new Object[]{caseName, caseDir}); //NON-NLS
-    }
-
-    /**
-     * Sanitizes the case name for PostgreSQL database, Solr cores, and ActiveMQ
-     * topics. Makes it plain-vanilla enough that each item should be able to
-     * use it.
-     *
-     * Solr:
-     * http://stackoverflow.com/questions/29977519/what-makes-an-invalid-core-name
-     * may not be / \ :
-     *
-     * ActiveMQ:
-     * http://activemq.2283324.n4.nabble.com/What-are-limitations-restrictions-on-destination-name-td4664141.html
-     * may not be ?
-     *
-     * PostgreSQL:
-     * http://www.postgresql.org/docs/9.4/static/sql-syntax-lexical.html 63
-     * chars max, must start with a-z or _ following chars can be letters _ or
-     * digits
-     *
-     * SQLite: Uses autopsy.db for the database name and follows the Windows
-     * naming convention
-     *
-     * @param caseName A candidate case name.
-     *
-     * @return The sanitized case name.
-     */
-    static String sanitizeCaseName(String caseName) {
-
-        String result;
-
-        // Remove all non-ASCII characters
-        result = caseName.replaceAll("[^\\p{ASCII}]", "_"); //NON-NLS
-
-        // Remove all control characters
-        result = result.replaceAll("[\\p{Cntrl}]", "_"); //NON-NLS
-
-        // Remove / \ : ? space ' "
-        result = result.replaceAll("[ /?:'\"\\\\]", "_"); //NON-NLS
-
-        // Make it all lowercase
-        result = result.toLowerCase();
-
-        // Must start with letter or underscore for PostgreSQL. If not, prepend an underscore.
-        if (result.length() > 0 && !(Character.isLetter(result.codePointAt(0))) && !(result.codePointAt(0) == '_')) {
-            result = "_" + result;
-        }
-
-        // Chop to 63-16=47 left (63 max for PostgreSQL, taking 16 for the date _20151225_123456)
-        if (result.length() > MAX_SANITIZED_CASE_NAME_LEN) {
-            result = result.substring(0, MAX_SANITIZED_CASE_NAME_LEN);
-        }
-
-        if (result.isEmpty()) {
-            result = "case"; //NON-NLS
-        }
-
-        return result;
-    }
-
-    /**
-     * Creates a case directory and its subdirectories.
-     *
-     * @param caseDir  Path to the case directory (typically base + case name).
-     * @param caseType The type of case, single-user or multi-user.
-     *
-     * @throws CaseActionException throw if could not create the case dir
-     */
-    static void createCaseDirectory(String caseDir, CaseType caseType) throws CaseActionException {
-
-        File caseDirF = new File(caseDir);
-        if (caseDirF.exists()) {
-            if (caseDirF.isFile()) {
-                throw new CaseActionException(
-                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.existNotDir", caseDir));
-            } else if (!caseDirF.canRead() || !caseDirF.canWrite()) {
-                throw new CaseActionException(
-                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.existCantRW", caseDir));
-            }
-        }
-
-        try {
-            boolean result = (caseDirF).mkdirs(); // create root case Directory
-            if (result == false) {
-                throw new CaseActionException(
-                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreate", caseDir));
-            }
-
-            // create the folders inside the case directory
-            String hostClause = "";
-
-            if (caseType == CaseType.MULTI_USER_CASE) {
-                hostClause = File.separator + NetworkUtils.getLocalHostName();
-            }
-            result = result && (new File(caseDir + hostClause + File.separator + EXPORT_FOLDER)).mkdirs()
-                    && (new File(caseDir + hostClause + File.separator + LOG_FOLDER)).mkdirs()
-                    && (new File(caseDir + hostClause + File.separator + TEMP_FOLDER)).mkdirs()
-                    && (new File(caseDir + hostClause + File.separator + CACHE_FOLDER)).mkdirs();
-
-            if (result == false) {
-                throw new CaseActionException(
-                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreateCaseDir", caseDir));
-            }
-
-            final String modulesOutDir = caseDir + hostClause + File.separator + MODULE_FOLDER;
-            result = new File(modulesOutDir).mkdir();
-            if (result == false) {
-                throw new CaseActionException(
-                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreateModDir",
-                                modulesOutDir));
-            }
-
-            final String reportsOutDir = caseDir + hostClause + File.separator + REPORTS_FOLDER;
-            result = new File(reportsOutDir).mkdir();
-            if (result == false) {
-                throw new CaseActionException(
-                        NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.cantCreateReportsDir",
-                                modulesOutDir));
-            }
-
-        } catch (Exception e) {
-            throw new CaseActionException(
-                    NbBundle.getMessage(Case.class, "Case.createCaseDir.exception.gen", caseDir), e);
-        }
-    }
-
-    /**
-     * Opens an existing Autopsy case.
-     *
-     * @param caseMetadataFilePath The path of the case metadata (.aut) file.
-     *
-     * @throws CaseActionException if there is a problem opening the case. The
-     *                             exception will have a user-friendly message
-     *                             and may be a wrapper for a lower-level
-     *                             exception.
-     */
-    public static void open(String caseMetadataFilePath) throws CaseActionException {
-        logger.log(Level.INFO, "Opening case with metadata file path {0}", caseMetadataFilePath); //NON-NLS
-
-        /*
-         * Verify the extension of the case metadata file.
-         */
-        if (!caseMetadataFilePath.endsWith(CaseMetadata.getFileExtension())) {
-            throw new CaseActionException(NbBundle.getMessage(Case.class, "Case.open.exception.checkFile.msg", CaseMetadata.getFileExtension()));
-        }
-
-        try {
-            /*
-             * Get the case metadata required to open the case database.
-             */
-            CaseMetadata metadata = new CaseMetadata(Paths.get(caseMetadataFilePath));
-            CaseType caseType = metadata.getCaseType();
-
-            /*
-             * Open the case database.
-             */
-            SleuthkitCase db;
-            if (caseType == CaseType.SINGLE_USER_CASE) {
-                String dbPath = metadata.getCaseDatabasePath(); //NON-NLS
-                db = SleuthkitCase.openCase(dbPath);
-            } else {
-                if (!UserPreferences.getIsMultiUserModeEnabled()) {
-                    throw new CaseActionException(NbBundle.getMessage(Case.class, "Case.open.exception.multiUserCaseNotEnabled"));
-                }
-                try {
-                    db = SleuthkitCase.openCase(metadata.getCaseDatabaseName(), UserPreferences.getDatabaseConnectionInfo(), metadata.getCaseDirectory());
-                } catch (UserPreferencesException ex) {
-                    throw new CaseActionException(NbBundle.getMessage(Case.class, "Case.databaseConnectionInfo.error.msg"), ex);
-                }
-            }
-
-            /*
-             * Check for the presence of the UI and do things that can only be
-             * done with user interaction.
-             */
-            if (RuntimeProperties.coreComponentsAreActive()) {
-                /*
-                 * If the case database was upgraded for a new schema, notify
-                 * the user.
-                 */
-                if (null != db.getBackupDatabasePath()) {
-                    SwingUtilities.invokeLater(() -> {
-                        JOptionPane.showMessageDialog(
-                                WindowManager.getDefault().getMainWindow(),
-                                NbBundle.getMessage(Case.class, "Case.open.msgDlg.updated.msg", db.getBackupDatabasePath()),
-                                NbBundle.getMessage(Case.class, "Case.open.msgDlg.updated.title"),
-                                JOptionPane.INFORMATION_MESSAGE);
-                    });
-                }
-
-                /*
-                 * Look for the files for the data sources listed in the case
-                 * database and give the user the opportunity to locate any that
-                 * are missing.
-                 */
-                Map<Long, String> imgPaths = getImagePaths(db);
-                for (Map.Entry<Long, String> entry : imgPaths.entrySet()) {
-                    long obj_id = entry.getKey();
-                    String path = entry.getValue();
-                    boolean fileExists = (new File(path).isFile() || driveExists(path));
-                    if (!fileExists) {
-                        int ret = JOptionPane.showConfirmDialog(
-                                WindowManager.getDefault().getMainWindow(),
-                                NbBundle.getMessage(Case.class, "Case.checkImgExist.confDlg.doesntExist.msg", getAppName(), path),
-                                NbBundle.getMessage(Case.class, "Case.checkImgExist.confDlg.doesntExist.title"),
-                                JOptionPane.YES_NO_OPTION);
-                        if (ret == JOptionPane.YES_OPTION) {
-                            MissingImageDialog.makeDialog(obj_id, db);
-                        } else {
-                            logger.log(Level.WARNING, "Selected image files don't match old files!"); //NON-NLS
-                        }
-                    }
-                }
-            }
-            Case openedCase = new Case(metadata, db);
-            changeCurrentCase(openedCase);
-
-        } catch (CaseMetadataException ex) {
-            throw new CaseActionException(NbBundle.getMessage(Case.class, "Case.metaDataFileCorrupt.exception.msg"), ex); //NON-NLS
-        } catch (TskCoreException ex) {
-            SwingUtilities.invokeLater(() -> {
-                WindowManager.getDefault().getMainWindow().setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
-            });
-            /*
-             * SleuthkitCase.openCase throws TskCoreExceptions with
-             * user-friendly messages, so propagate the exception message.
-             */
-            throw new CaseActionException(ex.getMessage(), ex);
-        }
-    }
-
-    /**
-     * Gets the paths of data sources that are images.
-     *
-     * @param db A case database.
-     *
-     * @return A mapping of object ids to image paths.
-     */
-    static Map<Long, String> getImagePaths(SleuthkitCase db) {
-        Map<Long, String> imgPaths = new HashMap<>();
-        try {
-            Map<Long, List<String>> imgPathsList = db.getImagePaths();
-            for (Map.Entry<Long, List<String>> entry : imgPathsList.entrySet()) {
-                if (entry.getValue().size() > 0) {
-                    imgPaths.put(entry.getKey(), entry.getValue().get(0));
-                }
-            }
-        } catch (TskException ex) {
-            logger.log(Level.SEVERE, "Error getting image paths", ex); //NON-NLS
-        }
-        return imgPaths;
-    }
-
-    /**
-     * Updates the current case to the given case, firing property change events
-     * and updating the UI.
-     *
-     * @param newCase The new current case or null if there is no new current
-     *                case.
-     */
-    private static void changeCurrentCase(Case newCase) {
-        // close the existing case
-        Case oldCase = Case.currentCase;
-        Case.currentCase = null;
-        if (oldCase != null) {
-            SwingUtilities.invokeLater(() -> {
-                WindowManager.getDefault().getMainWindow().setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
-            });
-            IngestManager.getInstance().cancelAllIngestJobs(IngestJob.CancellationReason.CASE_CLOSED);
-            completeCaseChange(null); //closes windows, etc   
-            if (null != oldCase.tskErrorReporter) {
-                oldCase.tskErrorReporter.shutdown(); // stop listening for TSK errors for the old case
-                oldCase.tskErrorReporter = null;
-            }
-            eventPublisher.publishLocally(new AutopsyEvent(Events.CURRENT_CASE.toString(), oldCase, null));
-            if (CaseType.MULTI_USER_CASE == oldCase.getCaseType()) {
-                if (null != oldCase.collaborationMonitor) {
-                    oldCase.collaborationMonitor.shutdown();
-                }
-                eventPublisher.closeRemoteEventChannel();
-            }
-        }
-
-        if (newCase != null) {
-            currentCase = newCase;
-            Logger.setLogDirectory(currentCase.getLogDirectoryPath());
-            // sanity check
-            if (null != currentCase.tskErrorReporter) {
-                currentCase.tskErrorReporter.shutdown();
-            }
-            // start listening for TSK errors for the new case
-            currentCase.tskErrorReporter = new IntervalErrorReportData(currentCase, MIN_SECS_BETWEEN_TSK_ERROR_REPORTS,
-                    NbBundle.getMessage(Case.class, "IntervalErrorReport.ErrorText"));
-            completeCaseChange(currentCase);
-            SwingUtilities.invokeLater(() -> {
-                RecentCases.getInstance().addRecentCase(currentCase.getName(), currentCase.getCaseMetadata().getFilePath().toString()); // update the recent cases
-            });
-            if (CaseType.MULTI_USER_CASE == newCase.getCaseType()) {
-                try {
-                    /**
-                     * Use the text index name as the remote event channel name
-                     * prefix since it is unique, the same as the case database
-                     * name for a multiuser case, and is readily available
-                     * through the Case.getTextIndexName() API.
-                     */
-                    eventPublisher.openRemoteEventChannel(String.format(EVENT_CHANNEL_NAME, newCase.getTextIndexName()));
-                    currentCase.collaborationMonitor = new CollaborationMonitor();
-                } catch (AutopsyEventException | CollaborationMonitor.CollaborationMonitorException ex) {
-                    logger.log(Level.SEVERE, "Failed to setup for collaboration", ex); //NON-NLS
-                    MessageNotifyUtil.Notify.error(NbBundle.getMessage(Case.class, "Case.CollaborationSetup.FailNotify.Title"), NbBundle.getMessage(Case.class, "Case.CollaborationSetup.FailNotify.ErrMsg"));
-                }
-            }
-            eventPublisher.publishLocally(new AutopsyEvent(Events.CURRENT_CASE.toString(), null, currentCase));
-
-        } else {
-            Logger.setLogDirectory(PlatformUtil.getLogDirectory());
-        }
-        SwingUtilities.invokeLater(() -> {
-            WindowManager.getDefault().getMainWindow().setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
-        });
-    }
-
-    /**
-     * Updates the UI and does miscellaneous other things to complete changing
-     * the current case.
-     *
-     * @param newCase The new current case or null if there is no new current
-     *                case.
-     */
-    private static void completeCaseChange(Case newCase) {
-        logger.log(Level.INFO, "Changing Case to: {0}", newCase); //NON-NLS
-        if (newCase != null) { // new case is open
-
-            // clear the temp folder when the case is created / opened
-            Case.clearTempFolder();
-
-            if (RuntimeProperties.coreComponentsAreActive()) {
-                // enable these menus
-                SwingUtilities.invokeLater(() -> {
-                    CallableSystemAction.get(AddImageAction.class).setEnabled(true);
-                    CallableSystemAction.get(CaseCloseAction.class).setEnabled(true);
-                    CallableSystemAction.get(CasePropertiesAction.class).setEnabled(true);
-                    CallableSystemAction.get(CaseDeleteAction.class).setEnabled(true); // Delete Case menu
-                    CallableSystemAction.get(OpenTimelineAction.class).setEnabled(true);
-
-                    if (newCase.hasData()) {
-                        // open all top components
-                        CoreComponentControl.openCoreWindows();
-                    } else {
-                        // close all top components
-                        CoreComponentControl.closeCoreWindows();
-                    }
-                    addCaseNameToMainWindowTitle(currentCase.getName());
-                });
-            } else {
-                SwingUtilities.invokeLater(() -> {
-                    Frame f = WindowManager.getDefault().getMainWindow();
-                    f.setTitle(getAppName()); // set the window name to just application name           
-                });
-            }
-
-        } else { // case is closed
-            SwingUtilities.invokeLater(() -> {
-                if (RuntimeProperties.coreComponentsAreActive()) {
-
-                    // close all top components first
-                    CoreComponentControl.closeCoreWindows();
-
-                    // disable these menus
-                    CallableSystemAction.get(AddImageAction.class).setEnabled(false); // Add Image menu
-                    CallableSystemAction.get(CaseCloseAction.class).setEnabled(false); // Case Close menu
-                    CallableSystemAction.get(CasePropertiesAction.class).setEnabled(false); // Case Properties menu
-                    CallableSystemAction.get(CaseDeleteAction.class).setEnabled(false); // Delete Case menu
-                    CallableSystemAction.get(OpenTimelineAction.class).setEnabled(false);
-                }
-
-                //clear pending notifications
-                MessageNotifyUtil.Notify.clear();
-                Frame f = WindowManager.getDefault().getMainWindow();
-                f.setTitle(getAppName()); // set the window name to just application name
-            });
-
-            //try to force gc to happen
-            System.gc();
-            System.gc();
-        }
-
-        //log memory usage after case changed
-        logger.log(Level.INFO, PlatformUtil.getAllMemUsageInfo());
-
-    }
-
-    /**
-     * Empties the temp subdirectory for the current case.
-     */
-    private static void clearTempFolder() {
-        File tempFolder = new File(currentCase.getTempDirectory());
-        if (tempFolder.isDirectory()) {
-            File[] files = tempFolder.listFiles();
-            if (files.length > 0) {
-                for (File file : files) {
-                    if (file.isDirectory()) {
-                        deleteCaseDirectory(file);
-                    } else {
-                        file.delete();
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Changes the title of the main window to include the case name.
-     *
-     * @param newCaseName The name of the case.
-     */
-    private static void addCaseNameToMainWindowTitle(String newCaseName) {
-        if (!newCaseName.equals("")) {
-            Frame f = WindowManager.getDefault().getMainWindow();
-            f.setTitle(newCaseName + " - " + getAppName());
-        }
-    }
-
-    /**
-     * Deletes a case directory.
-     *
-     * @param casePath A case directory path.
-     *
-     * @return True if the deleteion succeeded, false otherwise.
-     */
-    static boolean deleteCaseDirectory(File casePath) {
-        logger.log(Level.INFO, "Deleting case directory: {0}", casePath.getAbsolutePath()); //NON-NLS
-        return FileUtil.deleteDir(casePath);
-    }
-
-    /**
-     * Gets the time zone(s) of the image data source(s) in this case.
-     *
-     * @return The set of time zones in use.
-     *
-     * @deprecated Use getTimeZones instead.
-     */
-    @Deprecated
-    public Set<TimeZone> getTimeZone() {
-        return getTimeZones();
-    }
-
-    /**
-     * Determines whether or not a given path is for a physical drive.
-     *
-     * @param path The path to test.
-     *
-     * @return True or false.
-     *
-     * @deprecated Use
-     * org.sleuthkit.autopsy.coreutils.DriveUtils.isPhysicalDrive instead.
-     */
-    @Deprecated
-    static boolean isPhysicalDrive(String path) {
-        return DriveUtils.isPhysicalDrive(path);
-    }
-
-    /**
-     * Determines whether or not a given path is for a local drive or partition.
-     *
-     * @param path The path to test.
-     *
-     * @deprecated Use org.sleuthkit.autopsy.coreutils.DriveUtils.isPartition
-     * instead.
-     */
-    @Deprecated
-    static boolean isPartition(String path) {
-        return DriveUtils.isPartition(path);
-    }
-
-    /**
-     * Determines whether or not a drive exists by eading the first byte and
-     * checking if it is a -1.
-     *
-     * @param path The path to test.
-     *
-     * @return True or false.
-     *
-     * @deprecated Use org.sleuthkit.autopsy.coreutils.DriveUtils.driveExists
-     * instead.
-     */
-    @Deprecated
-    static boolean driveExists(String path) {
-        return DriveUtils.driveExists(path);
+        closeCurrentCase();
     }
 
     /**
@@ -1552,21 +2601,6 @@ public class Case implements SleuthkitCase.ErrorObserver {
     }
 
     /**
-     * Creates an Autopsy case directory.
-     *
-     * @param caseDir  Path to the case directory (typically base + case name)
-     * @param caseName the case name (used only for error messages)
-     *
-     * @throws CaseActionException
-     * @Deprecated Use createCaseDirectory(String caseDir, CaseType caseType)
-     * instead
-     */
-    @Deprecated
-    static void createCaseDirectory(String caseDir, String caseName) throws CaseActionException {
-        createCaseDirectory(caseDir, CaseType.SINGLE_USER_CASE);
-    }
-
-    /**
      * Check if case is currently open.
      *
      * @return True if a case is open.
@@ -1575,20 +2609,7 @@ public class Case implements SleuthkitCase.ErrorObserver {
      */
     @Deprecated
     public static boolean existsCurrentCase() {
-        return currentCase != null;
-    }
-
-    /**
-     * Get module output directory path where modules should save their
-     * permanent data.
-     *
-     * @return absolute path to the module output directory
-     *
-     * @deprecated Use getModuleDirectory() instead.
-     */
-    @Deprecated
-    public String getModulesOutputDirAbsPath() {
-        return getModuleDirectory();
+        return isCaseOpen();
     }
 
     /**
@@ -1615,20 +2636,23 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @deprecated Do not use.
      */
     @Deprecated
-    public static PropertyChangeSupport getPropertyChangeSupport() {
-        return new PropertyChangeSupport(Case.class);
+    public static PropertyChangeSupport
+            getPropertyChangeSupport() {
+        return new PropertyChangeSupport(Case.class
+        );
     }
 
     /**
-     * Gets the full path to the case metadata file for this case.
+     * Get module output directory path where modules should save their
+     * permanent data.
      *
-     * @return configFilePath The case metadata file path.
+     * @return absolute path to the module output directory
      *
-     * @deprecated Use getCaseMetadata and CaseMetadata.getFilePath instead.
+     * @deprecated Use getModuleDirectory() instead.
      */
     @Deprecated
-    String getConfigFilePath() {
-        return getCaseMetadata().getFilePath().toString();
+    public String getModulesOutputDirAbsPath() {
+        return getModuleDirectory();
     }
 
     /**
@@ -1639,32 +2663,33 @@ public class Case implements SleuthkitCase.ErrorObserver {
      * @param imgId    The ID of the image.
      * @param timeZone The time zone of the image.
      *
+     * @return
+     *
+     * @throws org.sleuthkit.autopsy.casemodule.CaseActionException
+     *
      * @deprecated As of release 4.0
      */
     @Deprecated
     public Image addImage(String imgPath, long imgId, String timeZone) throws CaseActionException {
         try {
-            Image newDataSource = db.getImageById(imgId);
+            Image newDataSource = caseDb.getImageById(imgId);
             notifyDataSourceAdded(newDataSource, UUID.randomUUID());
             return newDataSource;
-        } catch (Exception ex) {
+        } catch (TskCoreException ex) {
             throw new CaseActionException(NbBundle.getMessage(this.getClass(), "Case.addImg.exception.msg"), ex);
         }
     }
 
     /**
-     * Finishes adding new local data source to the case. Sends out event and
-     * reopens windows if needed.
+     * Gets the time zone(s) of the image data source(s) in this case.
      *
-     * @param newDataSource new data source added
+     * @return The set of time zones in use.
      *
-     * @deprecated As of release 4.0, replaced by {@link #notifyAddingDataSource(java.util.UUID) and
-     * {@link #notifyDataSourceAdded(org.sleuthkit.datamodel.Content, java.util.UUID) and
-     * {@link #notifyFailedAddingDataSource(java.util.UUID)}
+     * @deprecated Use getTimeZones instead.
      */
     @Deprecated
-    void addLocalDataSource(Content newDataSource) {
-        notifyDataSourceAdded(newDataSource, UUID.randomUUID());
+    public Set<TimeZone> getTimeZone() {
+        return getTimeZones();
     }
 
     /**
@@ -1681,8 +2706,5 @@ public class Case implements SleuthkitCase.ErrorObserver {
     public void deleteReports(Collection<? extends Report> reports, boolean deleteFromDisk) throws TskCoreException {
         deleteReports(reports);
     }
-
-    @Deprecated
-    public static final String propStartup = "LBL_StartupDialog"; //NON-NLS
 
 }

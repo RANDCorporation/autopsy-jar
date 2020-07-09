@@ -1,7 +1,7 @@
 /*
  * Autopsy Forensic Browser
  *
- * Copyright 2011 - 2016 Basis Technology Corp.
+ * Copyright 2011 - 2017 Basis Technology Corp.
  * Contact: carrier <at> sleuthkit <dot> org
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,8 @@ public interface DisplayableItemNodeVisitor<T> {
     T visit(LocalFileNode dfn);
 
     T visit(VirtualDirectoryNode ldn);
+    
+    T visit(LocalDirectoryNode ldn);
 
     T visit(DirectoryNode dn);
 
@@ -90,6 +92,8 @@ public interface DisplayableItemNodeVisitor<T> {
     T visit(KeywordHits.ListNode khsn);
 
     T visit(KeywordHits.TermNode khmln);
+
+    T visit(KeywordHits.RegExpInstanceNode khmln);
 
     T visit(HashsetHits.RootNode hhrn);
 
@@ -153,6 +157,8 @@ public interface DisplayableItemNodeVisitor<T> {
     T visit(FileTypesByMimeType.MediaSubTypeNode ftByMimeTypeMediaSubType);
 
     T visit(EmptyNode.MessageNode emptyNode);
+
+    T visit(InterestingHits.InterestingItemTypeNode aThis);
 
     /**
      * Visitor with an implementable default behavior for all types. Override
@@ -237,6 +243,11 @@ public interface DisplayableItemNodeVisitor<T> {
         }
 
         @Override
+        public T visit(InterestingHits.InterestingItemTypeNode interestingItemTypeNode) {
+            return defaultVisit(interestingItemTypeNode);
+        }
+
+        @Override
         public T visit(DeletedContentNode dcn) {
             return defaultVisit(dcn);
         }
@@ -278,6 +289,11 @@ public interface DisplayableItemNodeVisitor<T> {
 
         @Override
         public T visit(KeywordHits.ListNode khsn) {
+            return defaultVisit(khsn);
+        }
+
+        @Override
+        public T visit(KeywordHits.RegExpInstanceNode khsn) {
             return defaultVisit(khsn);
         }
 
@@ -353,6 +369,11 @@ public interface DisplayableItemNodeVisitor<T> {
 
         @Override
         public T visit(VirtualDirectoryNode ldn) {
+            return defaultVisit(ldn);
+        }
+
+        @Override
+        public T visit(LocalDirectoryNode ldn) {
             return defaultVisit(ldn);
         }
 
